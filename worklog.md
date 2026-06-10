@@ -160,3 +160,32 @@ Stage Summary:
 - Open API fallback available via ZAI_API_KEY for environments where chat.z.ai returns 500
 - Owner command restored in CLI
 - All changes committed locally, need to push and rebuild on Windows server
+
+---
+Task ID: 6
+Agent: Main Agent
+Task: Self-test and verify AICQ communication end-to-end
+
+Work Log:
+- Tested AICQ server connectivity: aicq.online reachable (200)
+- Tested registration: POST /api/v1/auth/register/ai returns 201 with account:{id:...} and access_token
+- Tested JWT decode: sub claim matches account.id from registration
+- Tested WS auth: using JWT sub as nodeId → online_ack ✅; wrong nodeId → "nodeId does not match token subject" ❌
+- Discovered correct message format from aicqSDK source code:
+  - Send: {type:"message", to:friend_id, data:{id,from_id,to_id,type:"text",content,...}}
+  - Receive: {type:"message", from:senderId, data:{...content...}}
+  - Stream: {type:"stream_chunk", to:friend_id, chunkType:"text", data:"..."} + {type:"stream_end", to:friend_id}
+  - Friend accept: POST /api/v1/friends/requests/{request_id}/accept
+  - Friend request: POST /api/v1/friends/request with to_id field
+- Full E2E test: A registers → B registers → A sends friend request → B accepts → A sends WS message → B receives → B replies → A receives ✅
+- Rewrote agent/mod.rs based on aicqSDK findings
+- All communication verified working
+
+Stage Summary:
+- AICQ E2E communication fully verified
+- Message format matches official aicqSDK
+- Friend request/accept flow works
+- WS auth with JWT sub as nodeId works
+- Streaming (stream_chunk + stream_end) format implemented
+- Code committed (8890c95)
+
