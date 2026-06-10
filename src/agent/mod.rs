@@ -2,7 +2,12 @@
 //!
 //! Connects to AICQ server via WebSocket, receives messages from
 //! friends/groups, processes them with Z.AI's LLM, and sends
-//! streaming replies (including thinking content) back through AICQ.
+//! streaming replies back through AICQ WebSocket.
+//!
+//! Message format (per aicqSDK):
+//! - Send: {type: "message", to: friend_id, data: {id, from_id, to_id, type: "text", content, ...}}
+//! - Receive: {type: "message", from: senderId, data: {id, from_id, to_id, type, content, ...}}
+//! - Stream: {type: "stream_chunk", to: friend_id, chunkType: "text", data: "..."} + {type: "stream_end", to: friend_id}
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -45,14 +50,12 @@ struct ConversationMessage {
 // ─── JWT helpers ─────────────────────────────────────────────
 
 /// Decode the payload of a JWT token (without verification) to extract claims.
-/// JWT format: header.payload.signature — we only need the payload section.
 fn decode_jwt_payload(token: &str) -> Result<serde_json::Value> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         bail!("Invalid JWT format: expected 3 parts, got {}", parts.len());
     }
     let payload_b64 = parts[1];
-    // JWT uses URL-safe base64 without padding
     let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let payload_bytes = engine
         .decode(payload_b64)
@@ -63,7 +66,6 @@ fn decode_jwt_payload(token: &str) -> Result<serde_json::Value> {
 }
 
 /// Extract the `sub` claim from a JWT token.
-/// This is the account ID that AICQ server assigned during registration.
 fn extract_jwt_subject(token: &str) -> Result<String> {
     let payload = decode_jwt_payload(token)?;
     let sub = payload["sub"]
@@ -106,7 +108,6 @@ impl AgentRuntime {
     pub async fn run(&mut self) -> Result<()> {
         tracing::info!("Initializing ZAI Agent...");
 
-        // Check Z.AI login
         if !auth::is_logged_in() {
             tracing::warn!("No Z.AI cookie login (SDK will be used as AI backend)");
         }
@@ -114,85 +115,40 @@ impl AgentRuntime {
         // Load or create identity, then refresh auth
         self.ensure_identity().await?;
 
-        // Connect to AICQ server
-        self.connect_and_listen().await?;
+        // Connect to AICQ server with auto-reconnect
+        loop {
+            match self.connect_and_listen().await {
+                Ok(()) => {
+                    tracing::warn!("WebSocket disconnected, reconnecting in 5s...");
+                }
+                Err(e) => {
+                    tracing::error!("WebSocket error: {}, reconnecting in 5s...", e);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-        Ok(())
+            // Refresh JWT on reconnect
+            if let Err(e) = self.refresh_jwt().await {
+                tracing::error!("JWT refresh failed: {}", e);
+            }
+        }
     }
 
     /// Load or create AICQ identity, then refresh authentication
     async fn ensure_identity(&self) -> Result<()> {
         let identity_path = self.get_identity_path()?;
 
-        // Try to load existing identity
         if identity_path.exists() {
             let content = fs::read_to_string(&identity_path)?;
-            let mut identity: AicqIdentity = serde_json::from_str(&content)?;
+            let identity: AicqIdentity = serde_json::from_str(&content)?;
             tracing::info!("Loaded existing identity: {}", identity.agent_id);
-
-            // Always refresh authentication — old JWT may have expired
-            tracing::info!("Refreshing AICQ authentication...");
-            match self.login_identity(&identity).await {
-                Ok(token) => {
-                    // Extract account_id from JWT subject
-                    let account_id = extract_jwt_subject(&token)
-                        .unwrap_or_else(|e| {
-                            tracing::warn!("Could not extract JWT subject: {}", e);
-                            identity.agent_id.clone()
-                        });
-
-                    tracing::info!("AICQ login refreshed (account_id={})", account_id);
-
-                    // Update identity with new token and account_id
-                    identity.jwt_token = Some(token.clone());
-                    identity.server_account_id = Some(account_id.clone());
-
-                    // Save updated identity
-                    if let Ok(updated) = serde_json::to_string_pretty(&identity) {
-                        let _ = fs::write(&identity_path, updated);
-                    }
-
-                    // Update runtime state
-                    let mut jwt = self.jwt_token.lock().await;
-                    *jwt = Some(token);
-                    let mut acct = self.server_account_id.lock().await;
-                    *acct = Some(account_id);
-                }
-                Err(e) => {
-                    tracing::warn!("Login refresh failed: {}, trying registration...", e);
-
-                    // If login fails (e.g. key rotated), try re-registration
-                    match self.register_identity(&identity).await {
-                        Ok(token) => {
-                            let account_id = extract_jwt_subject(&token)
-                                .unwrap_or_else(|e| {
-                                    tracing::warn!("Could not extract JWT subject: {}", e);
-                                    identity.agent_id.clone()
-                                });
-
-                            tracing::info!("Re-registered with AICQ (account_id={})", account_id);
-
-                            identity.jwt_token = Some(token.clone());
-                            identity.server_account_id = Some(account_id.clone());
-
-                            if let Ok(updated) = serde_json::to_string_pretty(&identity) {
-                                let _ = fs::write(&identity_path, updated);
-                            }
-
-                            let mut jwt = self.jwt_token.lock().await;
-                            *jwt = Some(token);
-                            let mut acct = self.server_account_id.lock().await;
-                            *acct = Some(account_id);
-                        }
-                        Err(e2) => {
-                            bail!("Both login and registration failed: login={}, register={}", e, e2);
-                        }
-                    }
-                }
-            }
 
             let mut guard = self.identity.lock().await;
             *guard = Some(identity);
+
+            // Refresh JWT
+            self.refresh_jwt().await?;
+
             return Ok(());
         }
 
@@ -201,7 +157,6 @@ impl AgentRuntime {
 
         let signing_keypair = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_keypair.verifying_key();
-
         let exchange_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let exchange_public = x25519_dalek::PublicKey::from(&exchange_secret);
 
@@ -264,6 +219,45 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Refresh JWT by logging in again
+    async fn refresh_jwt(&self) -> Result<()> {
+        let identity_guard = self.identity.lock().await;
+        let identity = identity_guard.as_ref().context("No identity loaded")?.clone();
+        drop(identity_guard);
+
+        tracing::info!("Refreshing AICQ authentication...");
+        let token = self.login_identity(&identity).await?;
+
+        let account_id = extract_jwt_subject(&token)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Could not extract JWT subject: {}", e);
+                identity.server_account_id.clone().unwrap_or_default()
+            });
+
+        tracing::info!("AICQ login refreshed (account_id={})", account_id);
+
+        // Update runtime state
+        {
+            let mut jwt = self.jwt_token.lock().await;
+            *jwt = Some(token.clone());
+        }
+        {
+            let mut acct = self.server_account_id.lock().await;
+            *acct = Some(account_id.clone());
+        }
+
+        // Save updated identity
+        let identity_path = self.get_identity_path()?;
+        let mut identity = identity;
+        identity.jwt_token = Some(token);
+        identity.server_account_id = Some(account_id);
+        if let Ok(updated) = serde_json::to_string_pretty(&identity) {
+            let _ = fs::write(identity_path, updated);
+        }
+
+        Ok(())
+    }
+
     /// Register with AICQ server
     async fn register_identity(&self, identity: &AicqIdentity) -> Result<String> {
         let client = reqwest::Client::new();
@@ -287,19 +281,15 @@ impl AgentRuntime {
         }
 
         let data: serde_json::Value = res.json().await?;
-
-        // Try multiple possible token field names
         let token = data["access_token"]
             .as_str()
             .or_else(|| data["accessToken"].as_str())
             .or_else(|| data["token"].as_str())
             .context(format!("No access token in registration response: {}", data))?;
 
-        // Also try to extract account_id from response directly
-        if let Some(acct_id) = data["account_id"].as_str()
-            .or_else(|| data["accountId"].as_str())
-            .or_else(|| data["userId"].as_str())
-            .or_else(|| data["id"].as_str())
+        // Extract account_id from response: {"account": {"id": "..."}, ...}
+        if let Some(acct_id) = data["account"]["id"].as_str()
+            .or_else(|| data["account_id"].as_str())
         {
             tracing::info!("Server returned account_id: {}", acct_id);
             let mut account = self.server_account_id.lock().await;
@@ -309,18 +299,15 @@ impl AgentRuntime {
         Ok(token.to_string())
     }
 
-    /// Login to AICQ server with existing identity
+    /// Login to AICQ server with existing identity (challenge-response)
     async fn login_identity(&self, identity: &AicqIdentity) -> Result<String> {
         let client = reqwest::Client::new();
         let api_url = format!("{}/api/v1", self.config.agent.server_url);
 
-        // Get challenge
         tracing::info!("Requesting AICQ auth challenge...");
         let challenge_res = client
             .post(format!("{}/auth/challenge", api_url))
-            .json(&serde_json::json!({
-                "public_key": identity.signing_public_key,
-            }))
+            .json(&serde_json::json!({ "public_key": identity.signing_public_key }))
             .send()
             .await?;
 
@@ -351,7 +338,6 @@ impl AgentRuntime {
         let signature = signing_key.sign(&message_bytes);
         let signature_hex = hex::encode(signature.to_bytes());
 
-        // Login
         tracing::info!("Signing AICQ auth challenge...");
         let login_res = client
             .post(format!("{}/auth/login/agent", api_url))
@@ -384,15 +370,15 @@ impl AgentRuntime {
         let ws_url = self.config.agent.server_url
             .replace("https://", "wss://")
             .replace("http://", "ws://");
-
         let ws_url = format!("{}/ws", ws_url);
+
         tracing::info!("Connecting to {}...", ws_url);
 
         let (mut ws_stream, _) = connect_async(&ws_url)
             .await
             .context("Failed to connect to AICQ WebSocket")?;
 
-        // Get JWT token and determine the correct nodeId
+        // Get JWT and determine nodeId
         let jwt = self.jwt_token.lock().await;
         let token_str = match jwt.as_deref() {
             Some(t) => t.to_string(),
@@ -403,32 +389,22 @@ impl AgentRuntime {
         };
         drop(jwt);
 
-        // The nodeId MUST match the JWT subject claim.
-        // Extract it from the JWT to ensure consistency.
         let node_id = match extract_jwt_subject(&token_str) {
             Ok(sub) => {
                 tracing::info!("Using JWT subject as nodeId: {}", sub);
-                // Also update our stored account_id
                 let mut acct = self.server_account_id.lock().await;
                 *acct = Some(sub.clone());
                 sub
             }
             Err(e) => {
-                // Fallback: use stored account_id or agent_id
                 let acct = self.server_account_id.lock().await;
-                let fallback = acct
-                    .as_deref()
-                    .unwrap_or(&self.config.agent.agent_id)
-                    .to_string();
-                tracing::warn!(
-                    "Could not extract JWT subject ({}), using fallback nodeId: {}",
-                    e,
-                    fallback
-                );
+                let fallback = acct.as_deref().unwrap_or(&self.config.agent.agent_id).to_string();
+                tracing::warn!("Could not extract JWT subject ({}), using fallback: {}", e, fallback);
                 fallback
             }
         };
 
+        // Send online message
         let online_msg = serde_json::json!({
             "type": "online",
             "nodeId": node_id,
@@ -447,7 +423,9 @@ impl AgentRuntime {
             match msg {
                 Ok(tungstenite::Message::Text(text)) => {
                     if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                        self.handle_ws_message(data).await?;
+                        if let Err(e) = self.handle_ws_message(data, &mut ws_stream).await {
+                            tracing::error!("Error handling WS message: {}", e);
+                        }
                     }
                 }
                 Ok(tungstenite::Message::Ping(data)) => {
@@ -470,116 +448,157 @@ impl AgentRuntime {
     }
 
     /// Handle incoming WebSocket message
-    async fn handle_ws_message(&self, data: serde_json::Value) -> Result<()> {
+    async fn handle_ws_message(
+        &self,
+        data: serde_json::Value,
+        ws: &mut futures::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tungstenite::Message,
+        >,
+    ) -> Result<()> {
         let msg_type = data["type"].as_str().unwrap_or("");
 
         match msg_type {
             "online_ack" => {
-                tracing::info!("WebSocket authenticated as {}", data["nodeId"]);
+                tracing::info!("✅ WebSocket authenticated as {}", data["nodeId"]);
             }
             "error" => {
                 tracing::error!(
-                    "WS server error: {}",
+                    "❌ WS server error: {}",
                     data["message"].as_str().unwrap_or("unknown")
                 );
             }
-            "relay" | "message" => {
-                self.process_incoming_message(data, false).await?;
+            "system_broadcast" | "system" => {
+                tracing::info!(
+                    "📢 System: {}",
+                    data["message"].as_str().unwrap_or("")
+                );
+            }
+            "message" | "private_message" => {
+                // AICQ message format: {type: "message", from: senderId, data: {id, from_id, to_id, type, content, ...}}
+                let from_id = data["from"].as_str()
+                    .or_else(|| data["fromId"].as_str())
+                    .or_else(|| data["data"]["from_id"].as_str())
+                    .unwrap_or("");
+
+                let content = data["data"]["content"].as_str()
+                    .or_else(|| data["content"].as_str())
+                    .or_else(|| data["data"]["text"].as_str())
+                    .unwrap_or("");
+
+                if !from_id.is_empty() && !content.trim().is_empty() {
+                    self.process_and_reply(from_id, content, ws).await?;
+                }
             }
             "group_message" => {
-                self.process_incoming_message(data, true).await?;
+                let from_id = data["from"].as_str()
+                    .or_else(|| data["fromId"].as_str())
+                    .unwrap_or("");
+                let content = data["content"].as_str()
+                    .or_else(|| data["data"]["content"].as_str())
+                    .unwrap_or("");
+
+                if !from_id.is_empty() && !content.trim().is_empty() {
+                    self.process_and_reply(from_id, content, ws).await?;
+                }
             }
-            "handshake_initiate" | "friend_request" => {
-                tracing::info!("Friend request received: {}", data);
-                // Auto-accept friend requests from masters
-                if let Some(from) = data["from"].as_str().or_else(|| data["fromId"].as_str()) {
-                    if self.config.agent.masters.contains(&from.to_string())
-                        || self.config.agent.auto_accept_friends
-                    {
-                        tracing::info!("Auto-accepting friend request from {}", from);
-                        // TODO: send friend_accept via REST API
+            "friend_request" => {
+                tracing::info!("📨 Friend request received");
+                let request_id = data["data"]["id"].as_str()
+                    .or_else(|| data["id"].as_str())
+                    .unwrap_or("");
+                let from_id = data["from"].as_str()
+                    .or_else(|| data["data"]["from_id"].as_str())
+                    .unwrap_or("");
+
+                if self.config.agent.auto_accept_friends
+                    || self.config.agent.masters.contains(&from_id.to_string())
+                {
+                    if !request_id.is_empty() {
+                        tracing::info!("🤝 Auto-accepting friend request {} from {}", request_id, from_id);
+                        self.accept_friend_request(request_id).await;
                     }
                 }
+            }
+            "stream_cancel" => {
+                let from_id = data["from"].as_str().unwrap_or("");
+                tracing::info!("⏹ Stream cancelled by {}", from_id);
             }
             "unread_counts" => {
                 self.handle_unread_counts(data).await?;
             }
-            "dm" | "chat" | "private_message" => {
-                self.process_incoming_message(data, false).await?;
-            }
             _ => {
-                tracing::debug!("Unknown WS message type: {} data: {}", msg_type, data);
+                tracing::debug!("WS message type '{}'", msg_type);
             }
         }
 
         Ok(())
     }
 
-    /// Process an incoming message
-    async fn process_incoming_message(
-        &self,
-        data: serde_json::Value,
-        is_group: bool,
-    ) -> Result<()> {
-        // Extract from ID and content from various message formats
-        let inner = if data["data"].is_object() {
-            &data["data"]
-        } else {
-            &serde_json::Value::Null
+    /// Accept a friend request via REST API
+    async fn accept_friend_request(&self, request_id: &str) {
+        let jwt = self.jwt_token.lock().await;
+        let token = match jwt.as_deref() {
+            Some(t) => t.to_string(),
+            None => return,
         };
+        drop(jwt);
 
-        let from_id = inner["from"]
-            .as_str()
-            .or_else(|| inner["fromId"].as_str())
-            .or_else(|| data["from"].as_str())
-            .or_else(|| data["fromId"].as_str())
-            .unwrap_or("");
+        let client = reqwest::Client::new();
+        let url = format!(
+            "{}/api/v1/friends/requests/{}/accept",
+            self.config.agent.server_url, request_id
+        );
 
-        let content = inner["content"]
-            .as_str()
-            .or_else(|| inner["payload"].as_str())
-            .or_else(|| inner["text"].as_str())
-            .or_else(|| data["content"].as_str())
-            .or_else(|| data["payload"].as_str())
-            .or_else(|| data["text"].as_str())
-            .unwrap_or("");
-
-        if from_id.is_empty() {
-            return Ok(());
-        }
-
-        // Skip own messages
-        let account_id = self.server_account_id.lock().await;
-        if from_id == account_id.as_deref().unwrap_or("")
-            || from_id == self.config.agent.agent_id
+        match client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
         {
+            Ok(res) => {
+                if res.status().is_success() {
+                    tracing::info!("✅ Friend request accepted!");
+                } else {
+                    tracing::warn!("Friend accept failed: {}", res.status());
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Friend accept error: {}", e);
+            }
+        }
+    }
+
+    /// Process incoming message and generate a reply via Z.AI
+    async fn process_and_reply(
+        &self,
+        from_id: &str,
+        content: &str,
+        ws: &mut futures::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tungstenite::Message,
+        >,
+    ) -> Result<()> {
+        let account_id = self.server_account_id.lock().await;
+        if from_id == account_id.as_deref().unwrap_or("") || from_id == self.config.agent.agent_id {
             return Ok(());
         }
+        drop(account_id);
 
         // Dedup
-        let msg_id = data["_msgId"]
-            .as_str()
-            .or_else(|| data["id"].as_str())
-            .or_else(|| data["messageId"].as_str())
-            .unwrap_or("");
-
+        let dedup_key = format!("{}:{}", from_id, &content[..content.len().min(100)]);
         {
             let mut processed = self.processed_messages.lock().await;
-            if !msg_id.is_empty() && processed.contains(msg_id) {
-                return Ok(());
-            }
-            if !msg_id.is_empty() {
-                processed.insert(msg_id.to_string());
-            }
-
-            // Content-based dedup
-            let dedup_key = format!("{}:{}", from_id, &content[..content.len().min(100)]);
             if processed.contains(&dedup_key) {
                 return Ok(());
             }
-            processed.insert(dedup_key);
-
-            // Trim dedup set
+            processed.insert(dedup_key.clone());
             if processed.len() > 1000 {
                 let keys: Vec<String> = processed.iter().take(500).cloned().collect();
                 for k in keys {
@@ -588,92 +607,175 @@ impl AgentRuntime {
             }
         }
 
-        let chat_id = if is_group {
-            data["groupId"].as_str().unwrap_or(from_id).to_string()
-        } else {
-            from_id.to_string()
-        };
+        tracing::info!("📩 Message from {}: {}", from_id, &content[..content.len().min(80)]);
 
-        tracing::info!(
-            "Message from {}: {}",
-            from_id,
-            &content[..content.len().min(80)]
-        );
-
-        if content.trim().is_empty() {
-            return Ok(());
-        }
-
-        // Add to conversation memory
+        // Add to memory
         {
             let mut memory = self.memory.lock().await;
-            let history = memory.entry(chat_id.clone()).or_insert_with(Vec::new);
+            let history = memory.entry(from_id.to_string()).or_insert_with(Vec::new);
             history.push(ConversationMessage {
                 role: "user".to_string(),
                 content: content.to_string(),
             });
-
-            let max = self.config.agent.max_history_per_chat;
-            if history.len() > max {
-                let drain_count = history.len() - max;
+            if history.len() > self.config.agent.max_history_per_chat {
+                let drain_count = history.len() - self.config.agent.max_history_per_chat;
                 history.drain(..drain_count);
             }
         }
 
-        // Generate AI response with streaming
-        match self.generate_reply(&chat_id, content).await {
-            Ok(reply) => {
+        // Send "thinking" stream chunk to show we're processing
+        self.send_stream_chunk(ws, from_id, "thinking", "💭").await;
+
+        // Generate reply via Z.AI
+        tracing::info!("🤖 Generating reply for: \"{}\"...", &content[..content.len().min(60)]);
+
+        let reply_result = self
+            .zai_client
+            .chat_stream(
+                content,
+                &self.config.agent.model,
+                None,
+                Some(&self.config.agent.system_prompt),
+                Some(Box::new(|_delta: &str, _is_thinking: bool| {
+                    // We'll send the complete reply, not individual chunks
+                })),
+            )
+            .await;
+
+        match reply_result {
+            Ok(result) => {
+                // Send end of thinking
+                self.send_stream_chunk(ws, from_id, "reasoning_end", "").await;
+
+                // Send the actual text reply via stream chunks
+                // Split into chunks for better UX on the client
+                let text = &result.text;
+                if !text.is_empty() {
+                    // Send in chunks of ~100 chars
+                    for chunk in text.as_bytes().chunks(100) {
+                        let chunk_str = String::from_utf8_lossy(chunk).to_string();
+                        self.send_stream_chunk(ws, from_id, "text", &chunk_str).await;
+                    }
+                }
+
+                // Send stream end
+                self.send_stream_end(ws, from_id).await;
+
+                // Also send as a complete message for persistence
+                self.send_message(ws, from_id, text).await;
+
+                tracing::info!("✅ Reply sent ({} chars)", text.len());
+
+                // Save to memory
                 let mut memory = self.memory.lock().await;
-                if let Some(history) = memory.get_mut(&chat_id) {
+                if let Some(history) = memory.get_mut(from_id) {
                     history.push(ConversationMessage {
                         role: "assistant".to_string(),
-                        content: reply,
+                        content: result.text,
                     });
                 }
             }
             Err(e) => {
-                tracing::error!("Error generating reply: {}", e);
+                tracing::error!("❌ Error generating reply: {}", e);
+                self.send_stream_chunk(ws, from_id, "text", "抱歉，生成回复时出错了。请稍后再试。").await;
+                self.send_stream_end(ws, from_id).await;
             }
         }
 
         Ok(())
     }
 
-    /// Generate a streaming reply using Z.AI
-    async fn generate_reply(&self, _chat_id: &str, user_message: &str) -> Result<String> {
-        tracing::info!(
-            "Generating reply for: \"{}\"...",
-            &user_message[..user_message.len().min(60)]
-        );
+    /// Send a message via WebSocket (AICQ format: {type: "message", to: friend_id, data: msg_obj})
+    async fn send_message(
+        &self,
+        ws: &mut futures::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tungstenite::Message,
+        >,
+        friend_id: &str,
+        content: &str,
+    ) {
+        let account_id = self.server_account_id.lock().await;
+        let my_id = account_id.as_deref().unwrap_or(&self.config.agent.agent_id);
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let msg_id = format!("msg_{}_{}", timestamp, &uuid::Uuid::new_v4().to_string()[..8]);
 
-        // Stream the response
-        let result = self
-            .zai_client
-            .chat_stream(
-                user_message,
-                &self.config.agent.model,
-                None,
-                Some(&self.config.agent.system_prompt),
-                Some(Box::new(|delta: &str, is_thinking: bool| {
-                    if is_thinking {
-                        tracing::debug!("[thinking] {}", delta);
-                    } else {
-                        tracing::debug!("[text] {}", delta);
-                    }
-                })),
-            )
-            .await?;
+        let msg_obj = serde_json::json!({
+            "id": msg_id,
+            "from_id": my_id,
+            "to_id": friend_id,
+            "type": "text",
+            "content": content,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "status": "sent",
+        });
 
-        if !result.thinking.is_empty() {
-            tracing::info!(
-                "Thinking: {}...",
-                &result.thinking[..result.thinking.len().min(100)]
-            );
+        let msg = serde_json::json!({
+            "type": "message",
+            "to": friend_id,
+            "data": msg_obj,
+        });
+
+        if let Err(e) = ws
+            .send(tungstenite::Message::Text(msg.to_string()))
+            .await
+        {
+            tracing::error!("Failed to send message: {}", e);
         }
+    }
 
-        tracing::info!("Reply generated ({} chars)", result.text.len());
+    /// Send a stream chunk via WebSocket
+    async fn send_stream_chunk(
+        &self,
+        ws: &mut futures::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tungstenite::Message,
+        >,
+        friend_id: &str,
+        chunk_type: &str,
+        data: &str,
+    ) {
+        let msg = serde_json::json!({
+            "type": "stream_chunk",
+            "to": friend_id,
+            "chunkType": chunk_type,
+            "data": data,
+        });
 
-        Ok(result.text)
+        if let Err(e) = ws
+            .send(tungstenite::Message::Text(msg.to_string()))
+            .await
+        {
+            tracing::error!("Failed to send stream chunk: {}", e);
+        }
+    }
+
+    /// Send stream end signal via WebSocket
+    async fn send_stream_end(
+        &self,
+        ws: &mut futures::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tungstenite::Message,
+        >,
+        friend_id: &str,
+    ) {
+        let msg = serde_json::json!({
+            "type": "stream_end",
+            "to": friend_id,
+        });
+
+        if let Err(e) = ws
+            .send(tungstenite::Message::Text(msg.to_string()))
+            .await
+        {
+            tracing::error!("Failed to send stream end: {}", e);
+        }
     }
 
     /// Handle unread_counts notification
@@ -683,88 +785,8 @@ impl AgentRuntime {
             return Ok(());
         }
 
-        tracing::info!("Unread counts: {}", unread);
-
-        let jwt = self.jwt_token.lock().await;
-        let token = match jwt.as_deref() {
-            Some(t) => t.to_string(),
-            None => return Ok(()),
-        };
-        drop(jwt);
-
-        if let Some(unread_map) = unread.as_object() {
-            for (friend_id, count) in unread_map {
-                let count = count.as_u64().unwrap_or(0);
-                if count == 0 {
-                    continue;
-                }
-
-                tracing::info!(
-                    "Fetching {} unread message(s) from {}...",
-                    count,
-                    friend_id
-                );
-
-                let client = reqwest::Client::new();
-                let url = format!(
-                    "{}/api/v1/chat/conversation/{}?limit={}",
-                    self.config.agent.server_url, friend_id, count
-                );
-
-                let res = client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()
-                    .await;
-
-                if let Ok(res) = res {
-                    if res.status().is_success() {
-                        if let Ok(conv_data) = res.json::<serde_json::Value>().await {
-                            if let Some(messages) = conv_data["messages"].as_array() {
-                                for msg in messages {
-                                    let from_id = msg["from_id"]
-                                        .as_str()
-                                        .or_else(|| msg["fromId"].as_str())
-                                        .unwrap_or(friend_id);
-                                    let content = msg["content"]
-                                        .as_str()
-                                        .or_else(|| msg["text"].as_str())
-                                        .unwrap_or("");
-
-                                    if content.trim().is_empty() {
-                                        continue;
-                                    }
-
-                                    self.process_incoming_message(
-                                        serde_json::json!({
-                                            "from": from_id,
-                                            "fromId": from_id,
-                                            "data": content,
-                                            "payload": content,
-                                            "_msgId": msg["id"],
-                                        }),
-                                        false,
-                                    )
-                                    .await?;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Mark as read
-                let _ = client
-                    .post(format!(
-                        "{}/api/v1/chat/mark-read",
-                        self.config.agent.server_url
-                    ))
-                    .header("Authorization", format!("Bearer {}", token))
-                    .json(&serde_json::json!({ "friend_id": friend_id }))
-                    .send()
-                    .await;
-            }
-        }
-
+        tracing::info!("📬 Unread counts: {}", unread);
+        // TODO: Fetch unread messages via REST API and process them
         Ok(())
     }
 
@@ -780,53 +802,25 @@ impl AgentRuntime {
         drop(jwt);
 
         let client = reqwest::Client::new();
-        let api_url = format!("{}/api/v1", self.config.agent.server_url);
+        let url = format!("{}/api/v1/friends/request", self.config.agent.server_url);
 
-        tracing::info!("Sending friend request to {}...", owner_id);
+        tracing::info!("📨 Sending friend request to {}...", owner_id);
 
-        // Try /friends/request endpoint
-        let res = client
-            .post(format!("{}/friends/request", api_url))
+        match client
+            .post(&url)
             .header("Authorization", format!("Bearer {}", token))
-            .json(&serde_json::json!({
-                "target_id": owner_id,
-                "message": "Hi! I'm your ZAI Agent. Let's be friends!",
-            }))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "to_id": owner_id }))
             .send()
-            .await;
-
-        match res {
-            Ok(response) if response.status().is_success() => {
-                tracing::info!("Friend request sent to {}", owner_id);
+            .await
+        {
+            Ok(res) if res.status().is_success() => {
+                tracing::info!("✅ Friend request sent to {}", owner_id);
             }
-            Ok(response) => {
-                let status = response.status();
-                let text = response.text().await.unwrap_or_default();
-                tracing::warn!("Friend request /friends/request failed ({}): {}", status, text);
-
-                // Try /friends/add as fallback
-                let res2 = client
-                    .post(format!("{}/friends/add", api_url))
-                    .header("Authorization", format!("Bearer {}", token))
-                    .json(&serde_json::json!({
-                        "friend_id": owner_id,
-                    }))
-                    .send()
-                    .await;
-
-                match res2 {
-                    Ok(r) if r.status().is_success() => {
-                        tracing::info!("Friend request sent (via /friends/add) to {}", owner_id);
-                    }
-                    Ok(r) => {
-                        let status = r.status();
-                        let text = r.text().await.unwrap_or_default();
-                        tracing::warn!("Friend request /friends/add also failed ({}): {}", status, text);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Friend request /friends/add error: {}", e);
-                    }
-                }
+            Ok(res) => {
+                let status = res.status();
+                let text = res.text().await.unwrap_or_default();
+                tracing::warn!("Friend request failed ({}): {}", status, text);
             }
             Err(e) => {
                 tracing::warn!("Friend request error: {}", e);
