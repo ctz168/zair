@@ -842,30 +842,75 @@ impl AgentRuntime {
         };
         drop(jwt);
 
+        // Get our own server account ID for reference
+        let my_account_id = self.server_account_id.lock().await;
+        let my_id = my_account_id.as_deref().unwrap_or("unknown");
+        tracing::info!("My server account ID: {}", my_id);
+        drop(my_account_id);
+
         let client = reqwest::Client::new();
         let url = format!("{}/api/v1/friends/request", self.config.agent.server_url);
 
         tracing::info!("📨 Sending friend request to {}...", owner_id);
 
-        match client
+        let resp = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({ "to_id": owner_id }))
             .send()
+            .await;
+
+        match resp {
+            Ok(res) => {
+                let status = res.status();
+                let body = res.text().await.unwrap_or_default();
+                if status.is_success() {
+                    println!("✅ 好友请求已发送给 {}！请对方在AICQ上接受请求。", owner_id);
+                    tracing::info!("Friend request sent to {} (HTTP {}): {}", owner_id, status, body);
+                } else {
+                    println!("❌ 好友请求失败 (HTTP {}): {}", status, body);
+                    tracing::warn!("Friend request failed (HTTP {}): {}", status, body);
+                    // Try to parse the error for more context
+                    if let Ok(err_data) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(msg) = err_data["detail"].as_str().or(err_data["error"].as_str()).or(err_data["message"].as_str()) {
+                            println!("   错误详情: {}", msg);
+                            tracing::warn!("Error detail: {}", msg);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                println!("❌ 发送好友请求网络错误: {}", e);
+                tracing::warn!("Friend request error: {}", e);
+            }
+        }
+
+        // Also check current friends list for debugging
+        let friends_url = format!("{}/api/v1/friends", self.config.agent.server_url);
+        match client
+            .get(&friends_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
             .await
         {
             Ok(res) if res.status().is_success() => {
-                tracing::info!("✅ Friend request sent to {}", owner_id);
+                let body = res.text().await.unwrap_or_default();
+                tracing::info!("Current friends list: {}", body);
+                if let Ok(friends_data) = serde_json::from_str::<serde_json::Value>(&body) {
+                    let friends = friends_data["friends"].as_array()
+                        .or(friends_data.as_array());
+                    if let Some(flist) = friends {
+                        println!("📋 当前好友列表 ({}人):", flist.len());
+                        for f in flist {
+                            let fid = f["id"].as_str().or(f["account_id"].as_str()).unwrap_or("?");
+                            let fname = f["nickname"].as_str().or(f["display_name"].as_str()).or(f["name"].as_str()).unwrap_or("?");
+                            println!("   {} - {}", fid, fname);
+                        }
+                    }
+                }
             }
-            Ok(res) => {
-                let status = res.status();
-                let text = res.text().await.unwrap_or_default();
-                tracing::warn!("Friend request failed ({}): {}", status, text);
-            }
-            Err(e) => {
-                tracing::warn!("Friend request error: {}", e);
-            }
+            _ => {}
         }
 
         Ok(())

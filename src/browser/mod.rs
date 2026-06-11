@@ -637,7 +637,9 @@ pub async fn chat_via_browser(
     }
 
     // Find and type into the textarea using JS (React-compatible)
-    tracing::info!("Sending message: \"{}\"", &message[..message.len().min(60)]);
+    // Safe truncation that respects UTF-8 char boundaries
+    let msg_preview: String = message.chars().take(60).collect();
+    tracing::info!("Sending message: \"{}\"", msg_preview);
 
     // First, check if we can find the textarea
     let textarea_check = cdp.evaluate(r#"
@@ -714,53 +716,63 @@ pub async fn chat_via_browser(
     for poll_idx in 0..120 { // max 2 minutes
         tokio::time::sleep(Duration::from_secs(1)).await;
 
+        // On first few polls, also log the page structure for debugging
+        if poll_idx < 3 {
+            let debug_info = cdp.evaluate(r#"
+                (() => {
+                    const md = document.querySelectorAll('.markdown-body');
+                    const msg = document.querySelectorAll('[class*="message"]');
+                    const prose = document.querySelectorAll('.prose');
+                    const think = document.querySelectorAll('[class*="think"]');
+                    return JSON.stringify({
+                        markdownBodyCount: md.length,
+                        lastMdLen: md.length > 0 ? md[md.length-1].innerText.length : 0,
+                        messageCount: msg.length,
+                        proseCount: prose.length,
+                        thinkCount: think.length,
+                        url: window.location.href,
+                    });
+                })()
+            "#).await;
+            tracing::info!("DOM debug (poll #{}): {:?}", poll_idx, debug_info);
+        }
+
         // Extract the latest assistant message from the DOM
-        // Try multiple strategies for finding the response
+        // We use a focused strategy: find the LAST assistant/AI message block
+        // Z.AI's chat interface renders messages as separate DOM nodes.
+        // We look for the last AI response by searching for markdown-body elements
+        // which contain the rendered AI reply.
         let result = cdp.evaluate(r#"
             (() => {
-                // Strategy 1: Look for the last message in chat (most reliable for Z.AI)
-                // Z.AI uses various class names, try to find any message-like containers
-                
-                // Try specific Z.AI selectors first
-                const zaiSelectors = [
-                    '.chat-conversation-item:last-child .message-text',
-                    '.chat-conversation-item:last-child .markdown-body',
-                    '.conversation-item:last-child .message-content',
-                    '.message-list-item:last-child .assistant-text',
+                // Strategy 1: Find the last .markdown-body element (Z.AI renders AI responses as markdown)
+                const markdownEls = document.querySelectorAll('.markdown-body');
+                if (markdownEls.length > 0) {
+                    // Get the last one - this is the current AI response
+                    const lastEl = markdownEls[markdownEls.length - 1];
+                    return lastEl.innerText;
+                }
+
+                // Strategy 2: Look for common AI response container patterns
+                const aiSelectors = [
+                    '.message-assistant:last-child .message-text',
+                    '.assistant-message:last-child',
+                    '[data-role="assistant"]:last-child',
+                    '.chat-message:last-child .markdown',
+                    '.prose:last-child',  // Tailwind prose class used for AI responses
                 ];
-                for (const sel of zaiSelectors) {
+                for (const sel of aiSelectors) {
                     const el = document.querySelector(sel);
                     if (el && el.innerText.trim()) return el.innerText;
                 }
-                
-                // Strategy 2: Find all text blocks that look like messages
-                const allMarkdown = document.querySelectorAll('.markdown-body, .markdown, [class*="markdown"], [class*="message-text"], [class*="assistant"]');
-                if (allMarkdown.length > 0) {
-                    // Get the last non-empty one
-                    for (let i = allMarkdown.length - 1; i >= 0; i--) {
-                        const text = allMarkdown[i].innerText.trim();
-                        if (text.length > 0) return text;
-                    }
+
+                // Strategy 3: Find all message-like blocks and get the last one
+                // This is a fallback that looks for any element with "message" or "chat" in its class
+                const allBlocks = document.querySelectorAll('[class*="message-text"], [class*="markdown"], [class*="prose"]');
+                if (allBlocks.length > 0) {
+                    const last = allBlocks[allBlocks.length - 1];
+                    if (last.innerText.trim()) return last.innerText;
                 }
-                
-                // Strategy 3: Check for any new content in the main chat area
-                const chatArea = document.querySelector('.chat-messages, .conversation-list, [class*="chat-content"], [class*="conversation-content"], main');
-                if (chatArea) {
-                    const allText = chatArea.innerText.trim();
-                    if (allText.length > 0) {
-                        // Return just the last portion (after any user message)
-                        const lines = allText.split('\n');
-                        // Find content after the last "hello" or user input
-                        return lines.slice(-20).join('\n');
-                    }
-                }
-                
-                // Strategy 4: Just get all visible text as last resort
-                const body = document.body.innerText;
-                if (body.length > 100) {
-                    return body.slice(-500);
-                }
-                
+
                 return '';
             })()
         "#).await;
@@ -768,24 +780,60 @@ pub async fn chat_via_browser(
         if let Ok(val) = result {
             if let Some(text) = val.as_str() {
                 let text = text.to_string();
-                if text.len() > last_length && text.len() > 0 {
-                    let delta = &text[last_length..];
-                    if !delta.is_empty() {
-                        let is_thinking = text.contains("<think") && !text.contains("</think>");
-                        if is_thinking {
-                            thinking_text.push_str(delta);
+                let text_len = text.len();
+
+                if text_len > 0 {
+                    if text_len > last_length {
+                        // New content detected - extract the delta
+                        // Find the nearest valid char boundary at or after last_length
+                        let safe_start = if last_length <= text_len {
+                            let mut pos = last_length;
+                            while pos < text_len && !text.is_char_boundary(pos) {
+                                pos += 1;
+                            }
+                            pos
                         } else {
-                            eprint!("{}", delta);
-                            reply_text.push_str(delta);
+                            text_len
+                        };
+
+                        if safe_start < text_len {
+                            let delta = &text[safe_start..];
+                            if !delta.is_empty() {
+                                let is_thinking = text.contains("<think") && !text.contains("</think>");
+                                if is_thinking {
+                                    thinking_text.push_str(delta);
+                                } else {
+                                    eprint!("{}", delta);
+                                    reply_text.push_str(delta);
+                                }
+                            }
                         }
-                    }
-                    last_length = text.len();
-                    stable_count = 0;
-                } else if !text.is_empty() {
-                    stable_count += 1;
-                    if stable_count >= 5 {
-                        tracing::info!("Response complete (stable for 5s, poll #{})", poll_idx);
-                        break;
+                        last_length = text_len;
+                        stable_count = 0;
+                    } else if text_len < last_length {
+                        // Text got shorter - DOM was re-rendered (React update).
+                        // This can happen during streaming if React replaces the element.
+                        // Reset and output the full current text since we can't reliably diff.
+                        tracing::debug!("DOM text shrunk ({} -> {}), likely React re-render", last_length, text_len);
+                        // Only reset if we haven't already collected significant text
+                        if reply_text.is_empty() && thinking_text.is_empty() {
+                            let is_thinking = text.contains("<think") && !text.contains("</think>");
+                            if is_thinking {
+                                thinking_text = text.clone();
+                            } else {
+                                eprint!("{}", &text);
+                                reply_text = text.clone();
+                            }
+                        }
+                        last_length = text_len;
+                        stable_count = 0;
+                    } else {
+                        // Same length - content is stable
+                        stable_count += 1;
+                        if stable_count >= 5 {
+                            tracing::info!("Response complete (stable for 5s, poll #{})", poll_idx);
+                            break;
+                        }
                     }
                 }
             }
