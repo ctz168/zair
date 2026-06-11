@@ -1029,14 +1029,17 @@ async fn type_message_and_poll(
                 thinkingContainers.forEach(el => {
                     // Get the full text content of the thinking chain
                     const text = el.innerText.trim();
-                    if (text && text !== 'Thought Process' && text !== 'Thinking...') {
+                    if (text && text !== 'Thought Process' && text !== 'Thinking...' && text !== '正在思考' && text !== '跳过' && text !== '正在思考\n跳过' && text !== '跳过\n正在思考') {
                         thinkingText += text + '\n';
                     }
                 });
 
                 // Also check for the older thinking-block class (for backward compat)
                 document.querySelectorAll('[class*="thinking-block"]').forEach(el => {
-                    thinkingText += el.innerText.trim() + '\n';
+                    const text = el.innerText.trim();
+                    if (text && text !== 'Thought Process' && text !== 'Thinking...' && text !== '正在思考' && text !== '跳过' && text !== '正在思考\n跳过' && text !== '跳过\n正在思考') {
+                        thinkingText += text + '\n';
+                    }
                 });
 
                 let replyText = '';
@@ -1182,12 +1185,32 @@ async fn type_message_and_poll(
                         last_reply_length = reply_len;
                     }
 
-                    // Check stability
+                    // Check stability - but don't consider response "complete" if only
+                    // thinking placeholders are present (e.g. "正在思考", "跳过")
+                    let is_only_placeholder = |t: &str| -> bool {
+                        let trimmed = t.trim();
+                        trimmed.is_empty()
+                            || trimmed == "正在思考"
+                            || trimmed == "跳过"
+                            || trimmed == "正在思考\n跳过"
+                            || trimmed == "跳过\n正在思考"
+                            || trimmed == "Thought Process"
+                            || trimmed == "Thinking..."
+                            || trimmed == "思考过程"
+                    };
+
+                    let has_real_content = !is_only_placeholder(thinking) || !is_only_placeholder(reply);
                     if total_len > 0 && total_len == last_total_length {
-                        stable_count += 1;
-                        if stable_count >= 5 {
-                            tracing::info!("Response complete (stable for 5s, poll #{})", poll_idx);
-                            break;
+                        if !has_real_content {
+                            // Still in "thinking" phase - content is just placeholders
+                            // Don't increment stable_count, keep waiting for real content
+                            tracing::debug!("Stable but only placeholders (thinking: {} chars, reply: {} chars), continuing to wait", thinking_len, reply_len);
+                        } else {
+                            stable_count += 1;
+                            if stable_count >= 5 {
+                                tracing::info!("Response complete (stable for 5s, poll #{})", poll_idx);
+                                break;
+                            }
                         }
                     } else if total_len != last_total_length {
                         stable_count = 0;
