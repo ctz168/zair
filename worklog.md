@@ -189,3 +189,56 @@ Stage Summary:
 - Streaming (stream_chunk + stream_end) format implemented
 - Code committed (8890c95)
 
+---
+Task ID: 7
+Agent: Main Agent
+Task: Register AICQ account and perform full communication self-test
+
+Work Log:
+- Installed Rust toolchain and verified cargo check passes
+- Created comprehensive Python test suite (test_aicq.py):
+  - Ed25519 keypair generation (matching Rust's ed25519-dalek)
+  - AICQ agent registration via /api/v1/auth/register/ai
+  - Challenge-response login via /api/v1/auth/challenge + /auth/login/agent
+  - JWT payload decoding and subject extraction
+  - WebSocket connection with online message
+  - Open API chat test (if ZAI_API_KEY available)
+- Test Results (all passed):
+  - Registration: 201, returns access_token + account.id
+  - Challenge-response login: 200, returns new access_token
+  - JWT decode: sub=acd55e55279e472694ce4a392a433ce8 matches account.id
+  - WebSocket: connected, online message → online_ack ✅
+  - API endpoints: /friends (200), /friends/requests (200)
+- Registered human user account via browser (aicq.online):
+  - Email: zairtest2026@proton.me
+  - User ID: 1000115
+  - Display name: ZAIR Test User
+  - Tokens stored in localStorage (aicq_at, aicq_rt)
+- Bidirectional WebSocket communication test (test_aicq_bidirectional.py):
+  - AI Agent registers and connects WebSocket ✅
+  - Human user connects WebSocket ✅
+  - Human sends "你好，AI助手！我是人类用户。请回复我！" ✅
+  - AI receives message via WebSocket ✅
+  - AI sends reply via WebSocket ✅
+  - Human receives AI reply ✅
+  - Additional WS types verified: friends_online, presence, message_ack
+- Fixed Rust code issues found during testing:
+  1. JWT base64 decoding: Added padding fallback (URL_SAFE_NO_PAD → URL_SAFE with padding)
+  2. WebSocket stream splitting: Fixed connect_and_listen to split into ws_sink/ws_rx
+  3. Callback type mismatch: Fixed emit_delta_internal to accept &Option<&StreamCallback>
+  4. Added missing WS message handlers: friends_online, presence, message_ack
+- All fixes compile successfully (cargo check + cargo build --release)
+- Code committed: 7ddb4fb
+
+Stage Summary:
+- Full AICQ communication verified end-to-end with live server
+- Human (1000115) ↔ AI Agent bidirectional messaging works
+- All WS message types properly handled
+- 3 compile errors fixed, code builds cleanly
+- AICQ server API fully mapped:
+  - Registration: POST /api/v1/auth/register/ai → 201
+  - Login: POST /api/v1/auth/challenge → 200, POST /api/v1/auth/login/agent → 200
+  - Friends: POST /api/v1/friends/request → 201
+  - Accept: POST /api/v1/friends/requests/{id}/accept → 200
+  - Messages: WebSocket only (no REST API for messages)
+  - WS format: {type:"online",nodeId:<JWT sub>,token:<JWT>}
