@@ -263,3 +263,30 @@ Stage Summary:
 - Thinking process is sent to AICQ as stream_chunk messages with chunkType="thinking"
 - API attempts are completely skipped, saving ~1s per request
 - UTF-8-safe chunking prevents multi-byte character splitting
+
+---
+Task ID: 2
+Agent: main
+Task: Clean up server code repo, sync with official repo, add real-time streaming
+
+Work Log:
+- Analyzed repo: 1012 tracked files, ~2GB on disk, mostly irrelevant (skills/, openclaw-zero-token/, zai/, test scripts)
+- Removed from git tracking: openclaw-zero-token/ (429MB), zai/ (39MB), skills/ (800+ files), all Python test scripts, JS files, .env, package-lock.json
+- Deleted from disk: openclaw-zero-token/, zai/, auth.js, client.js, stealth.js, test scripts, download dist files
+- Updated .gitignore to prevent future tracking of these file types
+- Used git-filter-repo to remove files from entire git history (fix GitHub push protection secret detection)
+- Force pushed clean history to ctz168/zair (1012 → 10 tracked files, ~2GB → 60MB)
+- Added StreamChunk struct for real-time streaming from browser DOM polling
+- Modified chat_via_browser to accept optional mpsc::Sender<StreamChunk>
+- In DOM polling loop, thinking/reply deltas are sent through channel immediately
+- Refactored agent process_and_reply: creates mpsc::channel, spawns browser chat task, receives StreamChunks and forwards to AICQ WebSocket in real-time
+- reasoning_end signal sent on thinking-to-text transition
+- CLI chat mode passes None (preserves existing behavior)
+- Updated comments: browser/cookie mode is primary (not "API fallback")
+- Compilation verified, committed and pushed (7a7a53b)
+
+Stage Summary:
+- Repo cleaned: 1012→10 files, ~2GB→60MB, git history rewritten for secret cleanup
+- Real-time streaming: thinking/reply text now forwarded to AICQ as it's extracted from DOM
+- User can see AI thinking process in AICQ chat page in real-time (not after completion)
+- All changes pushed to ctz168/zair
