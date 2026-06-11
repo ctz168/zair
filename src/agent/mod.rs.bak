@@ -2,15 +2,12 @@
 //!
 //! Connects to AICQ server via WebSocket, receives messages from
 //! friends/groups, processes them with Z.AI's LLM, and sends
-//! replies back through AICQ WebSocket.
+//! streaming replies back through AICQ WebSocket.
 //!
-//! Key design: WebSocket I/O is split into:
-//! - Main read loop: processes incoming messages (including Pings)
-//! - Writer task: forwards outgoing messages from MPSC channel to WebSocket
-//! - Browser chat tasks: run in background, send replies through the channel
-//!
-//! This ensures the WebSocket connection stays alive (via Ping/Pong) even
-//! during long-running browser chat operations.
+//! Message format (per aicqSDK):
+//! - Send: {type: "message", to: friend_id, data: {id, from_id, to_id, type: "text", content, ...}}
+//! - Receive: {type: "message", from: senderId, data: {id, from_id, to_id, type, content, ...}}
+//! - Stream: {type: "stream_chunk", to: friend_id, chunkType: "text", data: "..."} + {type: "stream_end", to: friend_id}
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -22,7 +19,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite};
 
@@ -31,10 +27,6 @@ use crate::client::ZaiClient;
 use crate::config::AppConfig;
 
 // ─── Types ────────────────────────────────────────────────────
-
-/// Outgoing WebSocket message channel sender.
-/// Cloned and shared between the main loop and spawned browser chat tasks.
-type WsSender = tokio::sync::mpsc::Sender<tungstenite::Message>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AicqIdentity {
@@ -103,8 +95,6 @@ pub struct AgentRuntime {
     processed_messages: Arc<Mutex<HashSet<String>>>,
     jwt_token: Arc<Mutex<Option<String>>>,
     server_account_id: Arc<Mutex<Option<String>>>,
-    /// Semaphore to limit concurrent browser chats to 1 at a time
-    chat_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl AgentRuntime {
@@ -119,7 +109,6 @@ impl AgentRuntime {
             processed_messages: Arc::new(Mutex::new(HashSet::new())),
             jwt_token: Arc::new(Mutex::new(None)),
             server_account_id: Arc::new(Mutex::new(None)),
-            chat_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -144,7 +133,7 @@ impl AgentRuntime {
                     tracing::error!("WebSocket error: {}, reconnecting in 5s...", e);
                 }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
             // Refresh JWT on reconnect
             if let Err(e) = self.refresh_jwt().await {
@@ -316,7 +305,7 @@ impl AgentRuntime {
             .or_else(|| data["token"].as_str())
             .context(format!("No access token in registration response: {}", data))?;
 
-        // Extract account_id from response
+        // Extract account_id from response: {"account": {"id": "..."}, ...}
         if let Some(acct_id) = data["account"]["id"].as_str()
             .or_else(|| data["account_id"].as_str())
         {
@@ -394,15 +383,7 @@ impl AgentRuntime {
         Ok(token.to_string())
     }
 
-    /// Connect to AICQ WebSocket and listen for messages.
-    ///
-    /// Key design: WebSocket I/O is split into two parts:
-    /// 1. Writer task: reads from an MPSC channel and sends messages to WebSocket
-    /// 2. Main read loop: reads from WebSocket, handles pings, dispatches messages
-    ///
-    /// Browser chat runs in spawned background tasks, which send replies through
-    /// the MPSC channel. This ensures pings are always handled, keeping the
-    /// connection alive during long browser chat operations.
+    /// Connect to AICQ WebSocket and listen for messages
     async fn connect_and_listen(&self) -> Result<()> {
         let ws_url = self.config.agent.server_url
             .replace("https://", "wss://")
@@ -415,6 +396,7 @@ impl AgentRuntime {
             .await
             .context("Failed to connect to AICQ WebSocket")?;
 
+        // Split into sink (for sending) and stream (for receiving)
         let (mut ws_sink, mut ws_rx) = ws_stream.split();
 
         // Get JWT and determine nodeId
@@ -443,7 +425,7 @@ impl AgentRuntime {
             }
         };
 
-        // Send online message DIRECTLY through ws_sink (before moving it to writer task)
+        // Send online message
         let online_msg = serde_json::json!({
             "type": "online",
             "nodeId": node_id,
@@ -457,39 +439,18 @@ impl AgentRuntime {
 
         tracing::info!("WebSocket connected, authenticating...");
 
-        // Create MPSC channel for outgoing messages.
-        // All subsequent messages go through this channel, which is consumed
-        // by the writer task. This allows multiple spawned tasks to send
-        // messages concurrently without holding a mutable reference to ws_sink.
-        let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::channel::<tungstenite::Message>(100);
-
-        // Spawn writer task: forwards messages from channel to WebSocket
-        let writer_handle = tokio::spawn(async move {
-            while let Some(msg) = outgoing_rx.recv().await {
-                if ws_sink.send(msg).await.is_err() {
-                    tracing::warn!("WebSocket send failed, writer task exiting");
-                    break;
-                }
-            }
-            tracing::debug!("Writer task exited");
-        });
-
-        // Main read loop - only reads from WebSocket
-        // This ensures we always respond to pings, even when browser chat
-        // is running in a background task.
+        // Main message loop
         while let Some(msg) = ws_rx.next().await {
             match msg {
                 Ok(tungstenite::Message::Text(text)) => {
                     if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Err(e) = self.handle_ws_message(data, &outgoing_tx).await {
+                        if let Err(e) = self.handle_ws_message(data, &mut ws_sink).await {
                             tracing::error!("Error handling WS message: {}", e);
                         }
                     }
                 }
                 Ok(tungstenite::Message::Ping(data)) => {
-                    // Respond to server pings to keep connection alive
-                    // This is CRITICAL during long browser chat operations
-                    let _ = outgoing_tx.send(tungstenite::Message::Pong(data)).await;
+                    let _ = ws_sink.send(tungstenite::Message::Pong(data)).await;
                 }
                 Ok(tungstenite::Message::Close(_)) => {
                     tracing::warn!("WebSocket connection closed");
@@ -503,10 +464,6 @@ impl AgentRuntime {
             }
         }
 
-        // Clean up: drop sender to signal writer task to exit
-        drop(outgoing_tx);
-        let _ = writer_handle.await;
-
         tracing::info!("WebSocket loop ended");
         Ok(())
     }
@@ -515,44 +472,53 @@ impl AgentRuntime {
     async fn handle_ws_message(
         &self,
         data: serde_json::Value,
-        outgoing_tx: &WsSender,
+        ws: &mut futures::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tungstenite::Message,
+        >,
     ) -> Result<()> {
         let msg_type = data["type"].as_str().unwrap_or("");
 
         match msg_type {
             "online_ack" => {
-                tracing::info!("WebSocket authenticated as {}", data["nodeId"]);
+                tracing::info!("✅ WebSocket authenticated as {}", data["nodeId"]);
             }
             "error" => {
                 tracing::error!(
-                    "WS server error: {}",
+                    "❌ WS server error: {}",
                     data["message"].as_str().unwrap_or("unknown")
                 );
             }
             "system_broadcast" | "system" => {
                 tracing::info!(
-                    "System: {}",
+                    "📢 System: {}",
                     data["message"].as_str().unwrap_or("")
                 );
             }
             "friends_online" => {
+                // Server tells us which friends are currently online
                 let node_ids: Vec<&str> = data["nodeIds"]
                     .as_array()
                     .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                     .unwrap_or_default();
-                tracing::info!("Friends online: {:?}", node_ids);
+                tracing::info!("👥 Friends online: {:?}", node_ids);
             }
             "presence" => {
+                // Friend came online or went offline
                 let node_id = data["nodeId"].as_str().unwrap_or("");
                 let online = data["online"].as_bool().unwrap_or(false);
-                tracing::info!("{} is {}", node_id, if online { "online" } else { "offline" });
+                tracing::info!("👤 {} is {}", node_id, if online { "online" } else { "offline" });
             }
             "message_ack" => {
-                tracing::debug!("Message ack: to={} status={}", 
+                // Our message was acknowledged by the server
+                tracing::debug!("✉️ Message ack: to={} status={}", 
                     data["to"].as_str().unwrap_or("?"),
                     data["status"].as_str().unwrap_or("?"));
             }
             "message" | "private_message" => {
+                // AICQ message format: {type: "message", from: senderId, data: {id, from_id, to_id, type, content, ...}}
                 let from_id = data["from"].as_str()
                     .or_else(|| data["fromId"].as_str())
                     .or_else(|| data["data"]["from_id"].as_str())
@@ -564,10 +530,7 @@ impl AgentRuntime {
                     .unwrap_or("");
 
                 if !from_id.is_empty() && !content.trim().is_empty() {
-                    // Spawn browser chat as a BACKGROUND task.
-                    // This returns immediately, allowing the main loop to
-                    // continue processing pings and other messages.
-                    self.spawn_chat_reply(from_id, content, outgoing_tx.clone()).await;
+                    self.process_and_reply(from_id, content, ws).await?;
                 }
             }
             "group_message" => {
@@ -579,11 +542,11 @@ impl AgentRuntime {
                     .unwrap_or("");
 
                 if !from_id.is_empty() && !content.trim().is_empty() {
-                    self.spawn_chat_reply(from_id, content, outgoing_tx.clone()).await;
+                    self.process_and_reply(from_id, content, ws).await?;
                 }
             }
             "friend_request" => {
-                tracing::info!("Friend request received");
+                tracing::info!("📨 Friend request received");
                 let request_id = data["data"]["id"].as_str()
                     .or_else(|| data["id"].as_str())
                     .unwrap_or("");
@@ -595,14 +558,14 @@ impl AgentRuntime {
                     || self.config.agent.masters.contains(&from_id.to_string())
                 {
                     if !request_id.is_empty() {
-                        tracing::info!("Auto-accepting friend request {} from {}", request_id, from_id);
+                        tracing::info!("🤝 Auto-accepting friend request {} from {}", request_id, from_id);
                         self.accept_friend_request(request_id).await;
                     }
                 }
             }
             "stream_cancel" => {
                 let from_id = data["from"].as_str().unwrap_or("");
-                tracing::info!("Stream cancelled by {}", from_id);
+                tracing::info!("⏹ Stream cancelled by {}", from_id);
             }
             "unread_counts" => {
                 self.handle_unread_counts(data).await?;
@@ -613,177 +576,6 @@ impl AgentRuntime {
         }
 
         Ok(())
-    }
-
-    /// Spawn a background task to process a message and generate a reply via browser chat.
-    ///
-    /// This method returns immediately. The actual browser chat and reply sending
-    /// happen in a spawned tokio task, which communicates through the MPSC channel.
-    /// This design ensures the main WebSocket read loop is never blocked.
-    async fn spawn_chat_reply(
-        &self,
-        from_id: &str,
-        content: &str,
-        outgoing_tx: WsSender,
-    ) {
-        // Skip messages from self
-        {
-            let account_id = self.server_account_id.lock().await;
-            if from_id == account_id.as_deref().unwrap_or("") || from_id == self.config.agent.agent_id {
-                return;
-            }
-        }
-
-        // Clone all necessary data for the 'static spawned task
-        let memory = self.memory.clone();
-        let processed_messages = self.processed_messages.clone();
-        let config = self.config.clone();
-        let server_account_id = self.server_account_id.clone();
-        let chat_semaphore = self.chat_semaphore.clone();
-        let auth_state = auth::load_auth();
-        
-        let from_id_owned = from_id.to_string();
-        let content_owned = content.to_string();
-
-        tracing::info!("Message from {}: {}", from_id, &content.chars().take(80).collect::<String>());
-
-        tokio::spawn(async move {
-            // ── Dedup check ──
-            let content_preview: String = content_owned.chars().take(100).collect();
-            let dedup_key = format!("{}:{}", from_id_owned, content_preview);
-            {
-                let mut processed = processed_messages.lock().await;
-                if processed.contains(&dedup_key) {
-                    tracing::debug!("Skipping duplicate message from {}", from_id_owned);
-                    return;
-                }
-                processed.insert(dedup_key);
-                if processed.len() > 1000 {
-                    let keys: Vec<String> = processed.iter().take(500).cloned().collect();
-                    for k in keys {
-                        processed.remove(&k);
-                    }
-                }
-            }
-
-            // ── Add to memory (user message) ──
-            {
-                let mut mem = memory.lock().await;
-                let history = mem.entry(from_id_owned.clone()).or_insert_with(Vec::new);
-                history.push(ConversationMessage {
-                    role: "user".to_string(),
-                    content: content_owned.clone(),
-                });
-                if history.len() > config.agent.max_history_per_chat {
-                    let drain_count = history.len() - config.agent.max_history_per_chat;
-                    history.drain(..drain_count);
-                }
-            }
-
-            // ── Acquire chat semaphore (limit to 1 concurrent browser chat) ──
-            // This prevents multiple Chrome instances from conflicting.
-            tracing::info!("Queuing browser chat for: \"{}\"...", content_owned.chars().take(60).collect::<String>());
-            let _permit = match tokio::time::timeout(
-                Duration::from_secs(300), // 5 minute queue timeout
-                chat_semaphore.acquire()
-            ).await {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(e)) => {
-                    tracing::error!("Semaphore acquire error: {}", e);
-                    return;
-                }
-                Err(_) => {
-                    tracing::warn!("Timeout waiting for chat semaphore, dropping message from {}", from_id_owned);
-                    return;
-                }
-            };
-            tracing::info!("Semaphore acquired, starting browser chat for: \"{}\"...", content_owned.chars().take(60).collect::<String>());
-
-            // ── Browser chat (with 5 minute timeout) ──
-            match auth_state {
-                Some(auth) => {
-                    let browser_result = tokio::time::timeout(
-                        Duration::from_secs(300), // 5 minute chat timeout
-                        crate::browser::chat_via_browser(&content_owned, &auth, None)
-                    ).await;
-
-                    match browser_result {
-                        Ok(Ok(result)) => {
-                            if !result.reply.is_empty() {
-                                // Build the full message: include thinking if present
-                                let full_reply = if !result.thinking.is_empty() {
-                                    format!(
-                                        "💭 **思考过程：**\n{}\n\n---\n\n{}",
-                                        result.thinking.trim(),
-                                        result.reply.trim()
-                                    )
-                                } else {
-                                    result.reply.clone()
-                                };
-
-                                // Send reply via the MPSC channel
-                                let my_id = {
-                                    let acct = server_account_id.lock().await;
-                                    acct.as_deref().unwrap_or(&config.agent.agent_id).to_string()
-                                };
-
-                                let msg_id = format!("msg_{}_{}", chrono::Utc::now().timestamp_millis(), &uuid::Uuid::new_v4().to_string()[..8]);
-                                let msg_obj = serde_json::json!({
-                                    "id": msg_id,
-                                    "from_id": my_id,
-                                    "to_id": from_id_owned,
-                                    "type": "text",
-                                    "content": full_reply,
-                                    "created_at": chrono::Utc::now().to_rfc3339(),
-                                    "status": "sent",
-                                });
-
-                                let msg = serde_json::json!({
-                                    "type": "message",
-                                    "to": from_id_owned,
-                                    "data": msg_obj,
-                                });
-
-                                match outgoing_tx.send(tungstenite::Message::Text(msg.to_string())).await {
-                                    Ok(_) => {
-                                        tracing::info!("Reply sent via browser (thinking: {} chars, reply: {} chars)", result.thinking.len(), result.reply.len());
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Failed to send reply through channel: {}", e);
-                                    }
-                                }
-
-                                // Save reply to memory
-                                let mut mem = memory.lock().await;
-                                if let Some(history) = mem.get_mut(&from_id_owned) {
-                                    history.push(ConversationMessage {
-                                        role: "assistant".to_string(),
-                                        content: result.reply,
-                                    });
-                                }
-                            } else {
-                                send_error_reply(&outgoing_tx, &from_id_owned, &server_account_id, &config, "抱歉，未能获取到回复。请稍后再试。").await;
-                                tracing::warn!("Empty reply from browser chat");
-                            }
-                        }
-                        Ok(Err(be)) => {
-                            tracing::error!("Browser chat failed: {}", be);
-                            send_error_reply(&outgoing_tx, &from_id_owned, &server_account_id, &config, "抱歉，生成回复时出错了。请稍后再试。").await;
-                        }
-                        Err(_) => {
-                            tracing::error!("Browser chat timed out (5 minutes)");
-                            send_error_reply(&outgoing_tx, &from_id_owned, &server_account_id, &config, "抱歉，回复生成超时。请稍后再试。").await;
-                        }
-                    }
-                }
-                None => {
-                    tracing::error!("No auth state - run zair login first");
-                    send_error_reply(&outgoing_tx, &from_id_owned, &server_account_id, &config, "抱歉，生成回复时出错了。请先运行 zair login。").await;
-                }
-            }
-
-            // _permit is dropped here, releasing the semaphore for the next chat
-        });
     }
 
     /// Accept a friend request via REST API
@@ -811,7 +603,7 @@ impl AgentRuntime {
         {
             Ok(res) => {
                 if res.status().is_success() {
-                    tracing::info!("Friend request accepted!");
+                    tracing::info!("✅ Friend request accepted!");
                 } else {
                     tracing::warn!("Friend accept failed: {}", res.status());
                 }
@@ -822,6 +614,209 @@ impl AgentRuntime {
         }
     }
 
+    /// Process incoming message and generate a reply via Z.AI
+    async fn process_and_reply(
+        &self,
+        from_id: &str,
+        content: &str,
+        ws: &mut futures::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tungstenite::Message,
+        >,
+    ) -> Result<()> {
+        let account_id = self.server_account_id.lock().await;
+        if from_id == account_id.as_deref().unwrap_or("") || from_id == self.config.agent.agent_id {
+            return Ok(());
+        }
+        drop(account_id);
+
+        // Dedup - safe UTF-8 truncation
+        let content_preview: String = content.chars().take(100).collect();
+        let dedup_key = format!("{}:{}", from_id, content_preview);
+        {
+            let mut processed = self.processed_messages.lock().await;
+            if processed.contains(&dedup_key) {
+                return Ok(());
+            }
+            processed.insert(dedup_key.clone());
+            if processed.len() > 1000 {
+                let keys: Vec<String> = processed.iter().take(500).cloned().collect();
+                for k in keys {
+                    processed.remove(&k);
+                }
+            }
+        }
+
+        tracing::info!("📩 Message from {}: {}", from_id, &content.chars().take(80).collect::<String>());
+
+        // Add to memory
+        {
+            let mut memory = self.memory.lock().await;
+            let history = memory.entry(from_id.to_string()).or_insert_with(Vec::new);
+            history.push(ConversationMessage {
+                role: "user".to_string(),
+                content: content.to_string(),
+            });
+            if history.len() > self.config.agent.max_history_per_chat {
+                let drain_count = history.len() - self.config.agent.max_history_per_chat;
+                history.drain(..drain_count);
+            }
+        }
+
+        // Use browser chat (no streaming channel — we collect the full result and send as one message)
+        tracing::info!("🤖 Generating reply via browser chat for: \"{}\"...", content.chars().take(60).collect::<String>());
+
+        let auth_state = auth::load_auth();
+        match auth_state {
+            Some(auth) => {
+                let msg_owned = content.to_string();
+
+                // Run browser chat WITHOUT streaming channel — just get the final result
+                let browser_result = crate::browser::chat_via_browser(&msg_owned, &auth, None).await;
+
+                match browser_result {
+                    Ok(result) => {
+                        if !result.reply.is_empty() {
+                            // Build the full message: include thinking if present
+                            let full_reply = if !result.thinking.is_empty() {
+                                format!(
+                                    "💭 **思考过程：**\n{}\n\n---\n\n{}",
+                                    result.thinking.trim(),
+                                    result.reply.trim()
+                                )
+                            } else {
+                                result.reply.clone()
+                            };
+
+                            // Send as a single complete message (most reliable for AICQ)
+                            self.send_message(ws, from_id, &full_reply).await;
+
+                            tracing::info!("✅ Reply sent via browser (thinking: {} chars, reply: {} chars)",
+                                result.thinking.len(), result.reply.len());
+
+                            // Save reply to memory
+                            let mut memory = self.memory.lock().await;
+                            if let Some(history) = memory.get_mut(from_id) {
+                                history.push(ConversationMessage {
+                                    role: "assistant".to_string(),
+                                    content: result.reply,
+                                });
+                            }
+                        } else {
+                            self.send_message(ws, from_id, "抱歉，未能获取到回复。请稍后再试。").await;
+                            tracing::warn!("⚠️ Empty reply from browser chat");
+                        }
+                    }
+                    Err(be) => {
+                        tracing::error!("❌ Browser chat failed: {}", be);
+                        self.send_message(ws, from_id, "抱歉，生成回复时出错了。请稍后再试。").await;
+                    }
+                }
+            }
+            None => {
+                tracing::error!("❌ No auth state - run zair login first");
+                self.send_message(ws, from_id, "抱歉，生成回复时出错了。请先运行 zair login。").await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Send a message via WebSocket (AICQ format: {type: "message", to: friend_id, data: msg_obj})
+    async fn send_message(
+        &self,
+        ws: &mut futures::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tungstenite::Message,
+        >,
+        friend_id: &str,
+        content: &str,
+    ) {
+        let account_id = self.server_account_id.lock().await;
+        let my_id = account_id.as_deref().unwrap_or(&self.config.agent.agent_id);
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let msg_id = format!("msg_{}_{}", timestamp, &uuid::Uuid::new_v4().to_string()[..8]);
+
+        let msg_obj = serde_json::json!({
+            "id": msg_id,
+            "from_id": my_id,
+            "to_id": friend_id,
+            "type": "text",
+            "content": content,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "status": "sent",
+        });
+
+        let msg = serde_json::json!({
+            "type": "message",
+            "to": friend_id,
+            "data": msg_obj,
+        });
+
+        if let Err(e) = ws
+            .send(tungstenite::Message::Text(msg.to_string()))
+            .await
+        {
+            tracing::error!("Failed to send message: {}", e);
+        }
+    }
+
+    /// Send a stream chunk via WebSocket
+    async fn send_stream_chunk(
+        &self,
+        ws: &mut futures::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tungstenite::Message,
+        >,
+        friend_id: &str,
+        chunk_type: &str,
+        data: &str,
+    ) {
+        let msg = serde_json::json!({
+            "type": "stream_chunk",
+            "to": friend_id,
+            "chunkType": chunk_type,
+            "data": data,
+        });
+
+        if let Err(e) = ws
+            .send(tungstenite::Message::Text(msg.to_string()))
+            .await
+        {
+            tracing::error!("Failed to send stream chunk: {}", e);
+        }
+    }
+
+    /// Send stream end signal via WebSocket
+    async fn send_stream_end(
+        &self,
+        ws: &mut futures::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            tungstenite::Message,
+        >,
+        friend_id: &str,
+    ) {
+        let msg = serde_json::json!({
+            "type": "stream_end",
+            "to": friend_id,
+        });
+
+        if let Err(e) = ws
+            .send(tungstenite::Message::Text(msg.to_string()))
+            .await
+        {
+            tracing::error!("Failed to send stream end: {}", e);
+        }
+    }
+
     /// Handle unread_counts notification
     async fn handle_unread_counts(&self, data: serde_json::Value) -> Result<()> {
         let unread = &data["unread"];
@@ -829,7 +824,7 @@ impl AgentRuntime {
             return Ok(());
         }
 
-        tracing::info!("Unread counts: {}", unread);
+        tracing::info!("📬 Unread counts: {}", unread);
         // TODO: Fetch unread messages via REST API and process them
         Ok(())
     }
@@ -854,7 +849,7 @@ impl AgentRuntime {
         let client = reqwest::Client::new();
         let url = format!("{}/api/v1/friends/request", self.config.agent.server_url);
 
-        tracing::info!("Sending friend request to {}...", owner_id);
+        tracing::info!("📨 Sending friend request to {}...", owner_id);
 
         let resp = client
             .post(&url)
@@ -869,21 +864,22 @@ impl AgentRuntime {
                 let status = res.status();
                 let body = res.text().await.unwrap_or_default();
                 if status.is_success() {
-                    println!("Friend request sent to {}!", owner_id);
+                    println!("✅ 好友请求已发送给 {}！请对方在AICQ上接受请求。", owner_id);
                     tracing::info!("Friend request sent to {} (HTTP {}): {}", owner_id, status, body);
                 } else {
-                    println!("Friend request failed (HTTP {}): {}", status, body);
+                    println!("❌ 好友请求失败 (HTTP {}): {}", status, body);
                     tracing::warn!("Friend request failed (HTTP {}): {}", status, body);
+                    // Try to parse the error for more context
                     if let Ok(err_data) = serde_json::from_str::<serde_json::Value>(&body) {
                         if let Some(msg) = err_data["detail"].as_str().or(err_data["error"].as_str()).or(err_data["message"].as_str()) {
-                            println!("   Error detail: {}", msg);
+                            println!("   错误详情: {}", msg);
                             tracing::warn!("Error detail: {}", msg);
                         }
                     }
                 }
             }
             Err(e) => {
-                println!("Friend request network error: {}", e);
+                println!("❌ 发送好友请求网络错误: {}", e);
                 tracing::warn!("Friend request error: {}", e);
             }
         }
@@ -903,7 +899,7 @@ impl AgentRuntime {
                     let friends = friends_data["friends"].as_array()
                         .or(friends_data.as_array());
                     if let Some(flist) = friends {
-                        println!("Current friends ({}):", flist.len());
+                        println!("📋 当前好友列表 ({}人):", flist.len());
                         for f in flist {
                             let fid = f["id"].as_str().or(f["account_id"].as_str()).unwrap_or("?");
                             let fname = f["nickname"].as_str().or(f["display_name"].as_str()).or(f["name"].as_str()).unwrap_or("?");
@@ -923,37 +919,4 @@ impl AgentRuntime {
         let data_dir = &self.config.agent.data_dir;
         Ok(PathBuf::from(data_dir).join("aicq").join("identity.json"))
     }
-}
-
-/// Helper to send an error reply via the outgoing channel
-async fn send_error_reply(
-    outgoing_tx: &WsSender,
-    from_id: &str,
-    server_account_id: &Arc<Mutex<Option<String>>>,
-    config: &AppConfig,
-    error_msg: &str,
-) {
-    let my_id = {
-        let acct = server_account_id.lock().await;
-        acct.as_deref().unwrap_or(&config.agent.agent_id).to_string()
-    };
-
-    let msg_id = format!("msg_{}_{}", chrono::Utc::now().timestamp_millis(), &uuid::Uuid::new_v4().to_string()[..8]);
-    let msg_obj = serde_json::json!({
-        "id": msg_id,
-        "from_id": my_id,
-        "to_id": from_id,
-        "type": "text",
-        "content": error_msg,
-        "created_at": chrono::Utc::now().to_rfc3339(),
-        "status": "sent",
-    });
-
-    let msg = serde_json::json!({
-        "type": "message",
-        "to": from_id,
-        "data": msg_obj,
-    });
-
-    let _ = outgoing_tx.send(tungstenite::Message::Text(msg.to_string())).await;
 }
