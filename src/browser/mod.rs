@@ -437,7 +437,21 @@ impl BrowserSession {
                     tracing::info!("Found existing Chrome on port {}, adopting it", self.port);
                     // We don't have the Child handle, but Chrome is running.
                     // This is fine - we'll check CDP reachability on each call.
-                    self.initialized = false; // Re-verify session state
+                    // Check if the existing Chrome session is already on chat.z.ai and logged in
+                    let url_check = cdp.evaluate("window.location.href").await
+                        .ok().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
+                    let has_ta = cdp.evaluate("document.querySelector('textarea') !== null").await
+                        .ok().and_then(|v| v.as_bool()).unwrap_or(false);
+                    let has_auth = cdp.evaluate("document.cookie.includes('acw_tc')").await
+                        .ok().and_then(|v| v.as_bool()).unwrap_or(false);
+                    if url_check.contains("chat.z.ai") && has_ta && has_auth {
+                        tracing::info!("Existing Chrome session already initialized on chat.z.ai");
+                        self.initialized = true;
+                    } else {
+                        tracing::info!("Existing Chrome found but needs re-initialization (url={}, ta={}, auth={})", 
+                            url_check.chars().take(50).collect::<String>(), has_ta, has_auth);
+                        self.initialized = false;
+                    }
                     return Ok(self.port);
                 }
             }
@@ -651,8 +665,37 @@ impl BrowserSession {
                 
                 // Navigate to root URL to start a new conversation
                 tracing::info!("Starting new conversation on existing session...");
-                cdp.navigate("https://chat.z.ai/").await?;
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                // Try clicking "New Chat" button first (faster than full navigation)
+                let new_chat_result = cdp.evaluate(r#"
+                    (() => {
+                        // Look for sidebar "New Chat" or similar button
+                        const links = document.querySelectorAll('a[href="/"], a[href="/c"], [class*="new-chat"], [class*="newChat"]');
+                        for (const link of links) {
+                            if (link.innerText.includes('新对话') || link.innerText.includes('New') || link.getAttribute('href') === '/') {
+                                link.click();
+                                return 'clicked_new_chat';
+                            }
+                        }
+                        // Fallback: look for any button with "new" or "新"
+                        const buttons = document.querySelectorAll('button');
+                        for (const btn of buttons) {
+                            const text = btn.innerText || '';
+                            if (text.includes('新对话') || text.includes('New Chat') || text.includes('新建')) {
+                                btn.click();
+                                return 'clicked_button';
+                            }
+                        }
+                        return 'not_found';
+                    })()
+                "#).await.ok().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
+                if new_chat_result != "not_found" {
+                    tracing::info!("New conversation via button: {}", new_chat_result);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                } else {
+                    // Fallback: navigate to root URL
+                    cdp.navigate("https://chat.z.ai/").await?;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
 
                 // Verify textarea is present (session might have expired)
                 let has_textarea = cdp.evaluate(r#"
