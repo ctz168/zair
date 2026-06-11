@@ -9,8 +9,8 @@
 //! - Writer task: forwards outgoing messages from MPSC channel to WebSocket
 //! - Browser chat tasks: run in background, send replies through the channel
 //!
-//! Browser session is persistent - Chrome is launched once and reused
-//! for all subsequent messages, reducing latency from ~50s to ~5-10s.
+//! This ensures the WebSocket connection stays alive (via Ping/Pong) even
+//! during long-running browser chat operations.
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -27,13 +27,13 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite};
 
 use crate::auth;
-use crate::browser::{BrowserSession, StreamChunk};
 use crate::client::ZaiClient;
 use crate::config::AppConfig;
 
 // ─── Types ────────────────────────────────────────────────────
 
 /// Outgoing WebSocket message channel sender.
+/// Cloned and shared between the main loop and spawned browser chat tasks.
 type WsSender = tokio::sync::mpsc::Sender<tungstenite::Message>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,15 +57,18 @@ struct ConversationMessage {
 
 // ─── JWT helpers ─────────────────────────────────────────────
 
+/// Decode the payload of a JWT token (without verification) to extract claims.
 fn decode_jwt_payload(token: &str) -> Result<serde_json::Value> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         bail!("Invalid JWT format: expected 3 parts, got {}", parts.len());
     }
     let payload_b64 = parts[1];
+    // Try URL_SAFE_NO_PAD first (most JWTs), then URL_SAFE with padding
     let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_b64)
         .or_else(|_| {
+            // Add padding if needed
             let padded = {
                 let pad_len = (4 - payload_b64.len() % 4) % 4;
                 format!("{}{}", payload_b64, "=".repeat(pad_len))
@@ -78,6 +81,7 @@ fn decode_jwt_payload(token: &str) -> Result<serde_json::Value> {
     Ok(payload)
 }
 
+/// Extract the `sub` claim from a JWT token.
 fn extract_jwt_subject(token: &str) -> Result<String> {
     let payload = decode_jwt_payload(token)?;
     let sub = payload["sub"]
@@ -101,8 +105,6 @@ pub struct AgentRuntime {
     server_account_id: Arc<Mutex<Option<String>>>,
     /// Semaphore to limit concurrent browser chats to 1 at a time
     chat_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Persistent browser session - Chrome stays alive between messages
-    browser_session: Arc<Mutex<Option<BrowserSession>>>,
 }
 
 impl AgentRuntime {
@@ -118,7 +120,6 @@ impl AgentRuntime {
             jwt_token: Arc::new(Mutex::new(None)),
             server_account_id: Arc::new(Mutex::new(None)),
             chat_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-            browser_session: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -130,6 +131,7 @@ impl AgentRuntime {
             tracing::warn!("No Z.AI cookie login (SDK will be used as AI backend)");
         }
 
+        // Load or create identity, then refresh auth
         self.ensure_identity().await?;
 
         // Connect to AICQ server with auto-reconnect
@@ -144,6 +146,7 @@ impl AgentRuntime {
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
 
+            // Refresh JWT on reconnect
             if let Err(e) = self.refresh_jwt().await {
                 tracing::error!("JWT refresh failed: {}", e);
             }
@@ -162,17 +165,23 @@ impl AgentRuntime {
             {
                 let mut guard = self.identity.lock().await;
                 *guard = Some(identity);
-            }
+            } // Drop the guard BEFORE calling refresh_jwt to avoid deadlock
 
+            // Refresh JWT - if this fails, delete the old identity and re-register
             match self.refresh_jwt().await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     tracing::warn!("JWT refresh failed ({}), re-registering...", e);
+                    
+                    // Delete the broken identity file
                     let _ = fs::remove_file(&identity_path);
+                    
+                    // Fall through to generate new identity
                 }
             }
         }
 
+        // Generate new identity
         tracing::info!("Generating new AICQ identity...");
 
         let signing_keypair = SigningKey::generate(&mut OsRng);
@@ -190,6 +199,7 @@ impl AgentRuntime {
             server_account_id: None,
         };
 
+        // Register with AICQ server
         let token = match self.register_identity(&identity).await {
             Ok(token) => {
                 tracing::info!("Registered with AICQ server");
@@ -201,6 +211,7 @@ impl AgentRuntime {
             }
         };
 
+        // Extract account_id from JWT subject
         let account_id = extract_jwt_subject(&token)
             .unwrap_or_else(|e| {
                 tracing::warn!("Could not extract JWT subject: {}", e);
@@ -209,15 +220,18 @@ impl AgentRuntime {
 
         tracing::info!("AICQ identity account_id={}", account_id);
 
+        // Update identity
         identity.jwt_token = Some(token.clone());
         identity.server_account_id = Some(account_id.clone());
 
+        // Save identity to disk
         if let Some(parent) = identity_path.parent() {
             fs::create_dir_all(parent)?;
         }
         let content = serde_json::to_string_pretty(&identity)?;
         fs::write(&identity_path, content)?;
 
+        // Update runtime state
         {
             let mut jwt = self.jwt_token.lock().await;
             *jwt = Some(token);
@@ -251,6 +265,7 @@ impl AgentRuntime {
 
         tracing::info!("AICQ login refreshed (account_id={})", account_id);
 
+        // Update runtime state
         {
             let mut jwt = self.jwt_token.lock().await;
             *jwt = Some(token.clone());
@@ -260,6 +275,7 @@ impl AgentRuntime {
             *acct = Some(account_id.clone());
         }
 
+        // Save updated identity
         let identity_path = self.get_identity_path()?;
         let mut identity = identity;
         identity.jwt_token = Some(token);
@@ -300,6 +316,7 @@ impl AgentRuntime {
             .or_else(|| data["token"].as_str())
             .context(format!("No access token in registration response: {}", data))?;
 
+        // Extract account_id from response
         if let Some(acct_id) = data["account"]["id"].as_str()
             .or_else(|| data["account_id"].as_str())
         {
@@ -334,6 +351,7 @@ impl AgentRuntime {
             .as_str()
             .context(format!("No challenge in response: {}", challenge_data))?;
 
+        // Sign challenge
         let secret_key_bytes = hex::decode(&identity.signing_secret_key)?;
         let key_bytes: [u8; 32] = secret_key_bytes
             .try_into()
@@ -377,6 +395,14 @@ impl AgentRuntime {
     }
 
     /// Connect to AICQ WebSocket and listen for messages.
+    ///
+    /// Key design: WebSocket I/O is split into two parts:
+    /// 1. Writer task: reads from an MPSC channel and sends messages to WebSocket
+    /// 2. Main read loop: reads from WebSocket, handles pings, dispatches messages
+    ///
+    /// Browser chat runs in spawned background tasks, which send replies through
+    /// the MPSC channel. This ensures pings are always handled, keeping the
+    /// connection alive during long browser chat operations.
     async fn connect_and_listen(&self) -> Result<()> {
         let ws_url = self.config.agent.server_url
             .replace("https://", "wss://")
@@ -391,6 +417,7 @@ impl AgentRuntime {
 
         let (mut ws_sink, mut ws_rx) = ws_stream.split();
 
+        // Get JWT and determine nodeId
         let jwt = self.jwt_token.lock().await;
         let token_str = match jwt.as_deref() {
             Some(t) => t.to_string(),
@@ -416,6 +443,7 @@ impl AgentRuntime {
             }
         };
 
+        // Send online message DIRECTLY through ws_sink (before moving it to writer task)
         let online_msg = serde_json::json!({
             "type": "online",
             "nodeId": node_id,
@@ -429,12 +457,18 @@ impl AgentRuntime {
 
         tracing::info!("WebSocket connected, authenticating...");
 
+        // Create MPSC channel for outgoing messages.
+        // All subsequent messages go through this channel, which is consumed
+        // by the writer task. This allows multiple spawned tasks to send
+        // messages concurrently without holding a mutable reference to ws_sink.
         let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::channel::<tungstenite::Message>(100);
 
+        // Spawn writer task: forwards messages from channel to WebSocket
         let writer_handle = tokio::spawn(async move {
             while let Some(msg) = outgoing_rx.recv().await {
                 match &msg {
                     tungstenite::Message::Text(text) => {
+                        // Log a preview of outgoing text messages
                         let preview: String = text.chars().take(120).collect();
                         tracing::info!("WS writer: sending text message ({} bytes): {}...", text.len(), preview);
                     }
@@ -449,6 +483,7 @@ impl AgentRuntime {
                     tracing::error!("WebSocket send failed: {}, writer task exiting", e);
                     break;
                 }
+                // Flush to ensure the message is actually sent over the wire
                 if let Err(e) = ws_sink.flush().await {
                     tracing::error!("WebSocket flush failed: {}, writer task exiting", e);
                     break;
@@ -457,6 +492,9 @@ impl AgentRuntime {
             tracing::info!("Writer task exited");
         });
 
+        // Main read loop - only reads from WebSocket
+        // This ensures we always respond to pings, even when browser chat
+        // is running in a background task.
         while let Some(msg) = ws_rx.next().await {
             match msg {
                 Ok(tungstenite::Message::Text(text)) => {
@@ -467,6 +505,8 @@ impl AgentRuntime {
                     }
                 }
                 Ok(tungstenite::Message::Ping(data)) => {
+                    // Respond to server pings to keep connection alive
+                    // This is CRITICAL during long browser chat operations
                     let _ = outgoing_tx.send(tungstenite::Message::Pong(data)).await;
                 }
                 Ok(tungstenite::Message::Close(_)) => {
@@ -481,18 +521,9 @@ impl AgentRuntime {
             }
         }
 
+        // Clean up: drop sender to signal writer task to exit
         drop(outgoing_tx);
         let _ = writer_handle.await;
-
-        // Shutdown browser session on disconnect (Chrome will be killed)
-        // Actually, let's keep Chrome alive for reconnection - only kill on program exit
-        // {
-        //     let mut session = self.browser_session.lock().await;
-        //     if let Some(ref mut s) = *session {
-        //         s.shutdown();
-        //     }
-        //     *session = None;
-        // }
 
         tracing::info!("WebSocket loop ended");
         Ok(())
@@ -551,6 +582,9 @@ impl AgentRuntime {
                     .unwrap_or("");
 
                 if !from_id.is_empty() && !content.trim().is_empty() {
+                    // Spawn browser chat as a BACKGROUND task.
+                    // This returns immediately, allowing the main loop to
+                    // continue processing pings and other messages.
                     self.spawn_chat_reply(from_id, content, outgoing_tx.clone()).await;
                 }
             }
@@ -601,8 +635,9 @@ impl AgentRuntime {
 
     /// Spawn a background task to process a message and generate a reply via browser chat.
     ///
-    /// Uses a persistent BrowserSession that keeps Chrome alive between messages,
-    /// reducing per-message latency from ~50s to ~5-10s.
+    /// This method returns immediately. The actual browser chat and reply sending
+    /// happen in a spawned tokio task, which communicates through the MPSC channel.
+    /// This design ensures the main WebSocket read loop is never blocked.
     async fn spawn_chat_reply(
         &self,
         from_id: &str,
@@ -617,12 +652,12 @@ impl AgentRuntime {
             }
         }
 
+        // Clone all necessary data for the 'static spawned task
         let memory = self.memory.clone();
         let processed_messages = self.processed_messages.clone();
         let config = self.config.clone();
         let server_account_id = self.server_account_id.clone();
         let chat_semaphore = self.chat_semaphore.clone();
-        let browser_session = self.browser_session.clone();
         let auth_state = auth::load_auth();
         
         let from_id_owned = from_id.to_string();
@@ -664,9 +699,10 @@ impl AgentRuntime {
             }
 
             // ── Acquire chat semaphore (limit to 1 concurrent browser chat) ──
+            // This prevents multiple Chrome instances from conflicting.
             tracing::info!("Queuing browser chat for: \"{}\"...", content_owned.chars().take(60).collect::<String>());
             let _permit = match tokio::time::timeout(
-                Duration::from_secs(300),
+                Duration::from_secs(300), // 5 minute queue timeout
                 chat_semaphore.acquire()
             ).await {
                 Ok(Ok(permit)) => permit,
@@ -681,76 +717,27 @@ impl AgentRuntime {
             };
             tracing::info!("Semaphore acquired, starting browser chat for: \"{}\"...", content_owned.chars().take(60).collect::<String>());
 
-            // ── Browser chat using persistent session ──
+            // ── Browser chat (with 5 minute timeout) ──
             match auth_state {
                 Some(auth) => {
-                    // Get or create the browser session
-                    let browser_result = {
-                        let mut session_guard = browser_session.lock().await;
-                        
-                        // Create session if it doesn't exist
-                        if session_guard.is_none() {
-                            tracing::info!("Creating new BrowserSession...");
-                            *session_guard = Some(BrowserSession::new(&auth));
-                        }
-
-                        let session = session_guard.as_mut().unwrap();
-                        
-                        // Chat with timeout
-                        tokio::time::timeout(
-                            Duration::from_secs(300),
-                            session.chat(&content_owned, None)
-                        ).await
-                    }; // session_guard is dropped here, releasing the mutex
+                    let browser_result = tokio::time::timeout(
+                        Duration::from_secs(300), // 5 minute chat timeout
+                        crate::browser::chat_via_browser(&content_owned, &auth, None)
+                    ).await;
 
                     match browser_result {
                         Ok(Ok(result)) => {
                             if !result.reply.is_empty() {
-                                // Strip user message from beginning of reply if present
-                                // Only strip if the user message is followed by a clear separator (newline)
-                                // to avoid cutting off the AI's actual response (e.g., "你好！" should not
-                                // be stripped to "！" just because the user said "你好")
-                                let clean_reply = {
-                                    let reply = result.reply.trim();
-                                    let user_msg = content_owned.trim();
-                                    
-                                    if reply.starts_with(user_msg) && reply.len() > user_msg.len() {
-                                        let after = &reply[user_msg.len()..];
-                                        // Only strip if followed by a newline (clear separator)
-                                        // This prevents stripping "你好" from "你好！" which is the AI's response
-                                        if after.starts_with('\n') || after.starts_with("\r\n") {
-                                            tracing::info!("Stripping user message prefix from reply ({} chars)", user_msg.len());
-                                            after.trim_start().to_string()
-                                        } else {
-                                            // No separator - this is the AI's own response starting with the same word
-                                            tracing::debug!("Reply starts with user message but no separator, keeping as-is");
-                                            reply.to_string()
-                                        }
-                                    } else if reply == user_msg {
-                                        // Reply is exactly the user message echoed back - no actual AI response
-                                        tracing::warn!("Reply is exactly the user message, likely echo");
-                                        String::new()
-                                    } else {
-                                        reply.to_string()
-                                    }
-                                };
-
-                                let clean_reply_len = clean_reply.len();
-                                let clean_reply_preview: String = clean_reply.chars().take(80).collect();
-
                                 // Build the full message: include thinking if present
                                 let full_reply = if !result.thinking.is_empty() {
                                     format!(
                                         "💭 **思考过程：**\n{}\n\n---\n\n{}",
                                         result.thinking.trim(),
-                                        clean_reply
+                                        result.reply.trim()
                                     )
                                 } else {
-                                    clean_reply
+                                    result.reply.clone()
                                 };
-
-                                tracing::info!("Extracted - thinking: {} chars, reply: {} chars, clean_reply: {} chars",
-                                    result.thinking.len(), result.reply.len(), clean_reply_len);
 
                                 // Send reply via the MPSC channel
                                 let my_id = {
@@ -799,16 +786,10 @@ impl AgentRuntime {
                         }
                         Ok(Err(be)) => {
                             tracing::error!("Browser chat failed: {}", be);
-                            // Reset session on error so it's re-initialized next time
-                            let mut session_guard = browser_session.lock().await;
-                            *session_guard = None;
                             send_error_reply(&outgoing_tx, &from_id_owned, &server_account_id, &config, "抱歉，生成回复时出错了。请稍后再试。").await;
                         }
                         Err(_) => {
                             tracing::error!("Browser chat timed out (5 minutes)");
-                            // Reset session on timeout
-                            let mut session_guard = browser_session.lock().await;
-                            *session_guard = None;
                             send_error_reply(&outgoing_tx, &from_id_owned, &server_account_id, &config, "抱歉，回复生成超时。请稍后再试。").await;
                         }
                     }
@@ -867,6 +848,7 @@ impl AgentRuntime {
         }
 
         tracing::info!("Unread counts: {}", unread);
+        // TODO: Fetch unread messages via REST API and process them
         Ok(())
     }
 
@@ -881,6 +863,7 @@ impl AgentRuntime {
         };
         drop(jwt);
 
+        // Get our own server account ID for reference
         let my_account_id = self.server_account_id.lock().await;
         let my_id = my_account_id.as_deref().unwrap_or("unknown");
         tracing::info!("My server account ID: {}", my_id);
@@ -923,6 +906,7 @@ impl AgentRuntime {
             }
         }
 
+        // Also check current friends list for debugging
         let friends_url = format!("{}/api/v1/friends", self.config.agent.server_url);
         match client
             .get(&friends_url)

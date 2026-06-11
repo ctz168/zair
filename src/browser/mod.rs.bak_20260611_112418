@@ -3,10 +3,6 @@
 //! Launches Chrome as a subprocess with --remote-debugging-port, then
 //! connects directly via WebSocket using the Chrome DevTools Protocol.
 //! This avoids chromiumoxide's deserialization errors with modern Chrome.
-//!
-//! Key design: Chrome is launched ONCE and kept alive between chat
-//! operations. Subsequent messages reuse the existing Chrome instance,
-//! reducing per-message latency from ~50s to ~5-10s.
 
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
@@ -80,11 +76,16 @@ struct CdpError {
     message: Option<String>,
 }
 
-// ─── CDP Port Constants ────────────────────────────────────────
+// ─── Chrome Process Manager ────────────────────────────────────
 
-/// CDP port for interactive (non-headless) Chrome (login mode)
+/// Manages a Chrome subprocess with remote debugging enabled
+struct ChromeProcess {
+    child: Option<Child>,
+    debug_port: u16,
+}
+
+/// Default CDP port for ZAI Chrome instances
 const ZAI_CDP_PORT: u16 = 9222;
-/// CDP port for headless Chrome (chat mode - persistent)
 const ZAI_CDP_PORT_HEADLESS: u16 = 9223;
 
 /// Default Chrome data directory name
@@ -94,33 +95,8 @@ fn chrome_data_dir() -> std::path::PathBuf {
         .join("zair-chrome")
 }
 
-/// Kill all Chrome processes (Windows + Unix)
-fn kill_chrome_processes() {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/f", "/im", "chrome.exe"])
-            .output();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = Command::new("pkill")
-            .arg("-9")
-            .arg("chrome")
-            .output();
-    }
-}
-
-// ─── Chrome Process Manager (for login only) ────────────────────
-
-/// Manages a Chrome subprocess with remote debugging enabled
-struct ChromeProcess {
-    child: Option<Child>,
-    debug_port: u16,
-}
-
 impl ChromeProcess {
-    /// Launch Chrome with remote debugging port (for login)
+    /// Launch Chrome with remote debugging port
     fn launch(headless: bool) -> Result<Self> {
         let chrome_path = which_chrome()?;
         let port = ZAI_CDP_PORT;
@@ -159,6 +135,64 @@ impl ChromeProcess {
         })
     }
 
+    /// Launch Chrome with headless mode and disable GPU (for server environments)
+    fn launch_headless() -> Result<Self> {
+        let chrome_path = which_chrome()?;
+        let port = ZAI_CDP_PORT_HEADLESS;
+
+        tracing::info!("Launching headless Chrome on port {}", port);
+
+        // Use the SAME data directory as login so we inherit the auth state.
+        // Kill any existing Chrome processes first to avoid profile lock conflicts.
+        let data_dir = chrome_data_dir();
+
+        // Try to kill existing Chrome instances that might hold the profile lock
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/f", "/im", "chrome.exe"])
+                .output();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = std::process::Command::new("pkill")
+                .arg("-9")
+                .arg("chrome")
+                .output();
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        let mut cmd = Command::new(&chrome_path);
+        cmd.args([
+            &format!("--remote-debugging-port={}", port),
+            &format!("--user-data-dir={}", data_dir.display()),
+            "--headless=new",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--disable-background-networking",
+            "--disable-client-side-phishing-detection",
+            "--disable-default-apps",
+            "--disable-hang-monitor",
+            "--disable-popup-blocking",
+            "--disable-prompt-on-repost",
+            "--disable-sync",
+            "--disable-translate",
+            "--metrics-recording-only",
+            "--safebrowsing-disable-auto-update",
+        ]);
+
+        let child = cmd.spawn().context("Failed to launch Chrome process")?;
+
+        Ok(Self {
+            child: Some(child),
+            debug_port: port,
+        })
+    }
+
     /// Get the debug URL for the browser target
     fn debug_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.debug_port)
@@ -169,10 +203,12 @@ impl ChromeProcess {
         let json_url = format!("{}/json", self.debug_url());
         let client = reqwest::Client::new();
 
+        // Retry a few times until Chrome is ready
         for attempt in 0..20 {
             match client.get(&json_url).send().await {
                 Ok(res) if res.status().is_success() => {
                     let targets: Vec<ChromeTarget> = res.json().await?;
+                    // Find a page target (not the browser itself)
                     for target in &targets {
                         if target.r#type.as_deref() == Some("page") {
                             if let Some(ws_url) = &target.ws_url {
@@ -181,6 +217,7 @@ impl ChromeProcess {
                             }
                         }
                     }
+                    // If no page target found, try the first target with ws_url
                     for target in &targets {
                         if let Some(ws_url) = &target.ws_url {
                             return Ok(ws_url.clone());
@@ -257,6 +294,7 @@ impl CdpConnection {
             .await
             .context("Failed to send CDP command")?;
 
+        // Wait for response with matching id
         let timeout = Duration::from_secs(30);
         let start = std::time::Instant::now();
 
@@ -271,6 +309,7 @@ impl CdpConnection {
                             return Ok(resp.result.unwrap_or(serde_json::Value::Null));
                         }
                     }
+                    // Not our response, skip (could be a CDP event)
                 }
                 Ok(Some(Ok(tungstenite::Message::Ping(data)))) => {
                     let _ = self.ws.send(tungstenite::Message::Pong(data)).await;
@@ -282,7 +321,7 @@ impl CdpConnection {
                 Ok(None) => {
                     bail!("CDP WebSocket closed");
                 }
-                Ok(Some(_)) => {}
+                Ok(Some(_)) => {} // Binary, Close, etc
                 Err(_) => {
                     continue;
                 }
@@ -315,6 +354,7 @@ impl CdpConnection {
             )
             .await?;
 
+        // Check for exception
         if let Some(exception) = result.get("exceptionDetails") {
             let desc = exception["exception"]["description"]
                 .as_str()
@@ -367,768 +407,103 @@ impl CdpConnection {
     }
 }
 
-// ─── Browser Session (Persistent Chrome) ────────────────────────
-
-/// Persistent browser session that keeps Chrome alive between chat operations.
-///
-/// Instead of launching Chrome for every message, this session launches Chrome
-/// once and reuses it for subsequent messages. This reduces per-message latency
-/// from ~50s to ~5-10s.
-pub struct BrowserSession {
-    /// Chrome child process handle - kept alive for the session lifetime
-    chrome_child: Option<Child>,
-    /// CDP port for the headless Chrome instance
-    port: u16,
-    /// Auth state for cookie injection
-    auth_state: ZaiAuthState,
-    /// Whether the session has been fully initialized (cookies injected, login verified)
-    initialized: bool,
-}
-
-impl BrowserSession {
-    /// Create a new browser session with the given auth state
-    pub fn new(auth_state: &ZaiAuthState) -> Self {
-        Self {
-            chrome_child: None,
-            port: ZAI_CDP_PORT_HEADLESS,
-            auth_state: auth_state.clone(),
-            initialized: false,
-        }
-    }
-
-    /// Ensure Chrome is running and reachable via CDP.
-    /// Returns the CDP port number.
-    pub async fn ensure_running(&mut self) -> Result<u16> {
-        // Check if our Chrome process is still alive
-        let child_alive = self.chrome_child.as_mut().map_or(false, |child| {
-            matches!(child.try_wait(), Ok(None))
-        });
-
-        if child_alive {
-            // Verify CDP is reachable
-            if let Ok(ws_url) = get_page_ws_url_for_port(self.port).await {
-                if let Ok(mut cdp) = CdpConnection::connect(&ws_url).await {
-                    if cdp.evaluate("1+1").await.ok().and_then(|v| v.as_u64()) == Some(2) {
-                        tracing::info!("Existing Chrome instance is alive on port {}", self.port);
-                        return Ok(self.port);
-                    }
-                }
-            }
-            // Chrome process alive but CDP not responding - kill and relaunch
-            tracing::warn!("Chrome process alive but CDP not responding, restarting...");
-            if let Some(ref mut child) = self.chrome_child {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            self.chrome_child = None;
-            self.initialized = false;
-        } else if self.chrome_child.is_some() {
-            // Chrome process exited
-            tracing::warn!("Chrome process has exited, restarting...");
-            self.chrome_child = None;
-            self.initialized = false;
-        }
-
-        // Try to connect to an existing Chrome instance on our port
-        // (maybe from a previous run that didn't shut down cleanly)
-        if let Ok(ws_url) = get_page_ws_url_for_port(self.port).await {
-            if let Ok(mut cdp) = CdpConnection::connect(&ws_url).await {
-                if cdp.evaluate("1+1").await.ok().and_then(|v| v.as_u64()) == Some(2) {
-                    tracing::info!("Found existing Chrome on port {}, adopting it", self.port);
-                    // We don't have the Child handle, but Chrome is running.
-                    // This is fine - we'll check CDP reachability on each call.
-                    self.initialized = false; // Re-verify session state
-                    return Ok(self.port);
-                }
-            }
-        }
-
-        // No existing Chrome - launch a new one
-        tracing::info!("Launching persistent headless Chrome on port {}...", self.port);
-        self.launch_chrome().await?;
-        Ok(self.port)
-    }
-
-    /// Launch a new Chrome instance
-    async fn launch_chrome(&mut self) -> Result<()> {
-        let chrome_path = which_chrome()?;
-        let data_dir = chrome_data_dir();
-
-        // Kill any existing Chrome that might hold the profile lock
-        kill_chrome_processes();
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        let mut cmd = Command::new(&chrome_path);
-        cmd.args([
-            &format!("--remote-debugging-port={}", self.port),
-            &format!("--user-data-dir={}", data_dir.display()),
-            "--headless=new",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-gpu",
-            "--disable-software-rasterizer",
-            "--disable-dev-shm-usage",
-            "--no-sandbox",
-            "--disable-background-networking",
-            "--disable-client-side-phishing-detection",
-            "--disable-default-apps",
-            "--disable-hang-monitor",
-            "--disable-popup-blocking",
-            "--disable-prompt-on-repost",
-            "--disable-sync",
-            "--disable-translate",
-            "--metrics-recording-only",
-            "--safebrowsing-disable-auto-update",
-            "--remote-allow-origins=*",
-        ]);
-
-        tracing::info!("Launching headless Chrome on port {}", self.port);
-        let child = cmd.spawn().context("Failed to launch Chrome process")?;
-        self.chrome_child = Some(child);
-
-        // Wait for Chrome to be ready
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        // Verify Chrome started
-        for attempt in 0..15 {
-            match get_page_ws_url_for_port(self.port).await {
-                Ok(_) => {
-                    tracing::info!("Chrome is ready on port {}", self.port);
-                    return Ok(());
-                }
-                Err(_) => {
-                    if attempt < 14 {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                }
-            }
-        }
-
-        bail!("Chrome failed to start on port {} after 10 seconds", self.port)
-    }
-
-    /// Initialize the browser session (inject cookies, verify login).
-    /// Called on first use or when the session needs to be re-initialized.
-    async fn initialize_session(&mut self, cdp: &mut CdpConnection) -> Result<()> {
-        if self.initialized {
-            return Ok(());
-        }
-
-        // Inject stealth scripts
-        inject_stealth_via_cdp(cdp).await?;
-
-        // Navigate to z.ai first (cookies need a domain context)
-        tracing::info!("Initializing browser session - navigating to chat.z.ai...");
-        cdp.navigate("https://chat.z.ai").await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // Inject cookies via CDP
-        inject_cookies_cdp(cdp, &self.auth_state.cookie).await?;
-
-        // Also inject via JavaScript as fallback
-        let js_cookie_result = cdp.evaluate(&format!(r#"
-            (() => {{
-                const cookieStr = {:?};
-                const pairs = cookieStr.split('; ');
-                let count = 0;
-                for (const pair of pairs) {{
-                    try {{
-                        document.cookie = pair + '; path=/; domain=.z.ai';
-                        count++;
-                    }} catch(e) {{}}
-                }}
-                return count;
-            }})()
-        "#, self.auth_state.cookie)).await;
-        tracing::info!("JS cookie injection result: {:?}", js_cookie_result);
-
-        // Reload with cookies now set
-        tracing::info!("Reloading chat.z.ai with cookies...");
-        cdp.navigate(ZAI_CHAT_URL).await?;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        // Force a hard reload
-        cdp.evaluate("location.reload(true)").await?;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        // Verify we're logged in
-        let login_check = cdp.evaluate(r#"
-            (() => {
-                const ta = document.querySelector('textarea');
-                const placeholder = ta ? ta.placeholder : '';
-                const cookieStr = document.cookie;
-                const hasAuth = cookieStr.includes('token=') || cookieStr.includes('chatglm');
-                return JSON.stringify({
-                    hasTextarea: ta !== null,
-                    placeholder: placeholder,
-                    hasAuthCookie: hasAuth,
-                    cookiePreview: cookieStr.substring(0, 200),
-                    url: window.location.href,
-                });
-            })()
-        "#).await;
-        tracing::info!("Login check after cookie injection: {:?}", login_check);
-
-        // Switch to Agent mode (better for automated tasks, has web search & tool use)
-        // The sidebar has "Chat 模式" (active) and "Agent 模式" buttons
-        let agent_mode_result = cdp.evaluate(r#"
-            (() => {
-                // Find the "Agent 模式" button in the sidebar
-                const buttons = document.querySelectorAll('button');
-                for (const btn of buttons) {
-                    if (btn.innerText && btn.innerText.includes('Agent') && btn.innerText.includes('模式')) {
-                        const isActive = btn.getAttribute('data-active') === 'true';
-                        if (!isActive) {
-                            btn.click();
-                            return 'clicked Agent mode';
-                        }
-                        return 'already in Agent mode';
-                    }
-                }
-                return 'Agent mode button not found';
-            })()
-        "#).await;
-        tracing::info!("Agent mode switch: {:?}", agent_mode_result);
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        self.initialized = true;
-        Ok(())
-    }
-
-    /// Chat with Z.AI using the persistent browser session.
-    /// Reuses the Chrome instance across calls for much faster response times.
-    pub async fn chat(
-        &mut self,
-        message: &str,
-        stream_tx: Option<tokio::sync::mpsc::Sender<StreamChunk>>,
-    ) -> Result<BrowserChatResult> {
-        tracing::info!("Starting browser chat...");
-        let start = std::time::Instant::now();
-
-        // Ensure Chrome is running
-        self.ensure_running().await?;
-
-        // Connect to Chrome CDP
-        let ws_url = get_page_ws_url_for_port(self.port).await?;
-        let mut cdp = CdpConnection::connect(&ws_url).await?;
-
-        // Enable domains
-        cdp.send_notification("Page.enable").await?;
-        cdp.send_notification("Network.enable").await?;
-        cdp.send_notification("Runtime.enable").await?;
-
-        if !self.initialized {
-            // Full initialization needed (first time or Chrome restarted)
-            self.initialize_session(&mut cdp).await?;
-        } else {
-            // Session already initialized - check if page is still valid
-            let current_url = cdp.evaluate("window.location.href").await
-                .ok()
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
-                .unwrap_or_default();
-
-            let on_chat_page = current_url.contains("chat.z.ai");
-
-            if on_chat_page {
-                // Ensure we're in Agent mode before starting a new conversation
-                let current_mode = cdp.evaluate(r#"
-                    (() => {
-                        const buttons = document.querySelectorAll('button');
-                        for (const btn of buttons) {
-                            if (btn.innerText && btn.innerText.includes('Agent') && btn.innerText.includes('模式')) {
-                                return btn.getAttribute('data-active') === 'true' ? 'agent' : 'chat';
-                            }
-                        }
-                        return 'unknown';
-                    })()
-                "#).await.ok().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
-                
-                if current_mode != "agent" {
-                    tracing::info!("Not in Agent mode (current: {}), switching...", current_mode);
-                    cdp.evaluate(r#"
-                        (() => {
-                            const buttons = document.querySelectorAll('button');
-                            for (const btn of buttons) {
-                                if (btn.innerText && btn.innerText.includes('Agent') && btn.innerText.includes('模式')) {
-                                    btn.click();
-                                    return 'switched';
-                                }
-                            }
-                            return 'not found';
-                        })()
-                    "#).await?;
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-                
-                // Navigate to root URL to start a new conversation
-                tracing::info!("Starting new conversation on existing session...");
-                cdp.navigate("https://chat.z.ai/").await?;
-                tokio::time::sleep(Duration::from_secs(2)).await;
-
-                // Verify textarea is present (session might have expired)
-                let has_textarea = cdp.evaluate(r#"
-                    (() => document.querySelector('textarea') !== null)()
-                "#).await.ok().and_then(|v| v.as_bool()).unwrap_or(false);
-
-                if !has_textarea {
-                    tracing::warn!("Session expired (no textarea), re-initializing...");
-                    self.initialized = false;
-                    self.initialize_session(&mut cdp).await?;
-                }
-            } else {
-                // Not on chat.z.ai - need to navigate there
-                tracing::info!("Not on chat.z.ai (at {}), re-initializing...", current_url);
-                self.initialized = false;
-                self.initialize_session(&mut cdp).await?;
-            }
-        }
-
-        // Type message and poll for response
-        type_message_and_poll(&mut cdp, message, stream_tx, start).await
-    }
-
-    /// Shutdown the browser session (kill Chrome)
-    pub fn shutdown(&mut self) {
-        if let Some(ref mut child) = self.chrome_child {
-            tracing::info!("Shutting down Chrome...");
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        self.chrome_child = None;
-        self.initialized = false;
-    }
-}
-
-impl Drop for BrowserSession {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-// ─── Cookie Injection Helpers ──────────────────────────────────
-
-/// Inject cookies via CDP (domain-level injection)
-async fn inject_cookies_cdp(cdp: &mut CdpConnection, cookie_string: &str) -> Result<()> {
-    let mut cookie_count = 0;
-    for cookie_part in cookie_string.split(';') {
-        let trimmed = cookie_part.trim();
-        if let Some(eq_idx) = trimmed.find('=') {
-            let name = &trimmed[..eq_idx];
-            let value = &trimmed[eq_idx + 1..];
-            for domain in &[".z.ai", "chat.z.ai", "z.ai"] {
-                match cdp.set_cookie(name, value, domain, "/").await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::debug!("Failed to set cookie {} for {}: {}", name, domain, e);
-                    }
-                }
-            }
-            cookie_count += 1;
-        }
-    }
-    tracing::info!("Injected {} cookies via CDP", cookie_count);
-    Ok(())
-}
-
-// ─── Message Typing & Response Polling ──────────────────────────
-
-/// Type a message into the chat textarea and poll for the response
-async fn type_message_and_poll(
-    cdp: &mut CdpConnection,
-    message: &str,
-    stream_tx: Option<tokio::sync::mpsc::Sender<StreamChunk>>,
-    start: std::time::Instant,
-) -> Result<BrowserChatResult> {
-    // Find and type into the textarea
-    let msg_preview: String = message.chars().take(60).collect();
-    tracing::info!("Sending message: \"{}\"", msg_preview);
-
-    // Check textarea state
-    let textarea_check = cdp.evaluate(r#"
-        (() => {
-            const ta = document.querySelector('textarea');
-            const ce = document.querySelector('[contenteditable="true"]');
-            return JSON.stringify({
-                hasTextarea: ta !== null,
-                hasContentEditable: ce !== null,
-                textareaPlaceholder: ta ? ta.placeholder : null,
-                url: window.location.href
-            });
-        })()
-    "#).await?;
-    tracing::info!("Page state: {:?}", textarea_check);
-
-    // Click on the textarea to focus it
-    cdp.evaluate(r#"
-        (() => {
-            const ta = document.querySelector('textarea') || document.querySelector('[contenteditable="true"]');
-            if (ta) { ta.focus(); ta.click(); }
-            return ta ? 'focused' : 'not_found';
-        })()
-    "#).await?;
-
-    // Small delay for focus
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Clear any existing content in the textarea (important for session reuse)
-    cdp.evaluate(r#"
-        (() => {
-            const ta = document.querySelector('textarea');
-            if (ta) {
-                ta.focus();
-                ta.select();
-            }
-            return 'cleared';
-        })()
-    "#).await?;
-
-    // Use Input.insertText to type the message
-    cdp.send_command(
-        "Input.insertText",
-        serde_json::json!({ "text": message }),
-    ).await?;
-
-    // Small delay for React to process
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Check if the textarea has content
-    let textarea_content = cdp.evaluate(r#"
-        (() => {
-            const ta = document.querySelector('textarea');
-            return ta ? ta.value : '';
-        })()
-    "#).await;
-    tracing::info!("Textarea content after insert: {:?}", textarea_content);
-
-    // If textarea is empty, try JavaScript-based input as fallback
-    if let Ok(val) = &textarea_content {
-        let content = val.as_str().unwrap_or("");
-        if content.is_empty() {
-            tracing::warn!("Input.insertText didn't work, trying JS-based input...");
-            let escaped_msg = message.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
-            cdp.evaluate(&format!(r#"
-                (() => {{
-                    const ta = document.querySelector('textarea');
-                    if (!ta) return 'no_textarea';
-                    
-                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                        window.HTMLTextAreaElement.prototype, 'value'
-                    ).set;
-                    nativeInputValueSetter.call(ta, "{escaped_msg}");
-                    ta.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    ta.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    return ta.value.substring(0, 50);
-                }})()
-            "#)).await?;
-        }
-    }
-
-    // Press Enter to send
-    cdp.send_command(
-        "Input.dispatchKeyEvent",
-        serde_json::json!({
-            "type": "keyDown",
-            "key": "Enter",
-            "code": "Enter",
-            "windowsVirtualKeyCode": 13,
-            "nativeVirtualKeyCode": 13,
-        }),
-    ).await?;
-
-    cdp.send_command(
-        "Input.dispatchKeyEvent",
-        serde_json::json!({
-            "type": "keyUp",
-            "key": "Enter",
-            "code": "Enter",
-            "windowsVirtualKeyCode": 13,
-            "nativeVirtualKeyCode": 13,
-        }),
-    ).await?;
-
-    // Wait and check if message was sent
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    let url_after_enter = cdp.evaluate("window.location.href").await
-        .ok()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_default();
-
-    if !url_after_enter.contains("/c/") {
-        tracing::warn!("Enter key didn't submit (URL: {}), trying send button...", url_after_enter);
-        cdp.evaluate(r#"
-            (() => {
-                const btn = document.querySelector('button[type="submit"]') ||
-                    document.querySelector('[class*="send"]') ||
-                    document.querySelector('[aria-label*="send"]') ||
-                    document.querySelector('[aria-label*="Send"]') ||
-                    document.querySelector('form button') ||
-                    document.querySelector('textarea').closest('form')?.querySelector('button');
-                if (btn) { btn.click(); return 'clicked'; }
-                const form = document.querySelector('textarea')?.closest('form');
-                if (form) { form.submit(); return 'form_submitted'; }
-                return 'no_button_found';
-            })()
-        "#).await?;
-    }
-
-    tracing::info!("Message sent, waiting for response...");
-
-    // Wait for response to start
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Poll for the response with streaming
-    let mut reply_text = String::new();
-    let mut thinking_text = String::new();
-    let mut last_thinking_length: usize = 0;
-    let mut last_reply_length: usize = 0;
-    let mut last_total_length: usize = 0;
-    let mut stable_count = 0;
-
-    for poll_idx in 0..120 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // Debug logging for first few polls
-        if poll_idx < 5 {
-            let debug_info = cdp.evaluate(r#"
-                (() => {
-                    const allClasses = new Set();
-                    document.querySelectorAll('*').forEach(el => {
-                        el.classList.forEach(c => allClasses.add(c));
-                    });
-                    const classList = [...allClasses].filter(c =>
-                        c.includes('message') || c.includes('chat') || c.includes('think') ||
-                        c.includes('response') || c.includes('answer') || c.includes('assistant') ||
-                        c.includes('markdown') || c.includes('prose') || c.includes('bubble') ||
-                        c.includes('content') || c.includes('reply') || c.includes('agent')
-                    ).sort();
-
-                    const lastElements = [];
-                    document.querySelectorAll('[class*="message"], [class*="response"], [class*="answer"], [class*="think"], [class*="assistant"]').forEach(el => {
-                        if (el.innerText && el.innerText.trim().length > 0 && el.children.length < 3) {
-                            lastElements.push({
-                                tag: el.tagName,
-                                classes: el.className,
-                                textLen: el.innerText.length,
-                                textPreview: el.innerText.substring(0, 50),
-                            });
-                        }
-                    });
-
-                    return JSON.stringify({
-                        relevantClasses: classList.slice(0, 30),
-                        elements: lastElements.slice(-5),
-                        url: window.location.href,
-                    });
-                })()
-            "#).await;
-            tracing::info!("DOM debug (poll #{}): {:?}", poll_idx, debug_info);
-        }
-
-        // Extract thinking and reply text
-        let result = cdp.evaluate(r#"
-            (() => {
-                let thinkingText = '';
-                document.querySelectorAll('[class*="thinking-block"]').forEach(el => {
-                    thinkingText += el.innerText.trim() + '\n';
-                });
-
-                let replyText = '';
-                const allChatAssistants = document.querySelectorAll('[class*="chat-assistant"]');
-                const chatAssistant = allChatAssistants.length > 0 ? allChatAssistants[allChatAssistants.length - 1] : null;
-                if (chatAssistant) {
-                    const clone = chatAssistant.cloneNode(true);
-                    clone.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="chain-of-thought"]').forEach(el => el.remove());
-                    clone.querySelectorAll('[class*="user-message"], [class*="edit-user-message"]').forEach(el => el.remove());
-                    replyText = clone.innerText.trim();
-                }
-
-                if (!replyText) {
-                    const allProse = document.querySelectorAll('[class*="markdown-prose"]');
-                    const prose = allProse.length > 0 ? allProse[allProse.length - 1] : null;
-                    if (prose) {
-                        const clone = prose.cloneNode(true);
-                        clone.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="user-message"]').forEach(el => el.remove());
-                        replyText = clone.innerText.trim();
-                    }
-                }
-
-                if (!replyText) {
-                    const allMsgs = document.querySelectorAll('[class*="message"]');
-                    for (let i = allMsgs.length - 1; i >= 0; i--) {
-                        const el = allMsgs[i];
-                        const classes = (el.className || '').toLowerCase();
-                        if (classes.includes('user-message')) continue;
-                        if (classes.includes('think') || classes.includes('reasoning')) continue;
-                        const clone = el.cloneNode(true);
-                        clone.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="user-message"]').forEach(e => e.remove());
-                        const text = clone.innerText.trim();
-                        if (text && text.length > 2) { replyText = text; break; }
-                    }
-                }
-
-                let rawAssistantText = '';
-                if (chatAssistant) {
-                    rawAssistantText = chatAssistant.innerText.substring(0, 300);
-                }
-
-                return JSON.stringify({ thinking: thinkingText.trim(), reply: replyText, debug_raw: rawAssistantText });
-            })()
-        "#).await;
-
-        if let Ok(val) = result {
-            if let Some(text) = val.as_str() {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
-                    let thinking = parsed["thinking"].as_str().unwrap_or("");
-                    let reply = parsed["reply"].as_str().unwrap_or("");
-
-                    let thinking_len = thinking.len();
-                    let reply_len = reply.len();
-                    let total_len = thinking_len + reply_len;
-
-                    // Track thinking deltas
-                    if thinking_len > last_thinking_length {
-                        let safe_start = if last_thinking_length <= thinking_len {
-                            let mut pos = last_thinking_length;
-                            while pos < thinking_len && !thinking.is_char_boundary(pos) {
-                                pos += 1;
-                            }
-                            pos
-                        } else {
-                            thinking_len
-                        };
-
-                        if safe_start < thinking_len {
-                            let delta = &thinking[safe_start..];
-                            if !delta.is_empty() {
-                                eprint!("{}", delta);
-                                thinking_text.push_str(delta);
-                                if let Some(ref tx) = stream_tx {
-                                    let _ = tx.send(StreamChunk {
-                                        chunk_type: "thinking".to_string(),
-                                        data: delta.to_string(),
-                                    }).await;
-                                }
-                            }
-                        }
-                        last_thinking_length = thinking_len;
-                    } else if thinking_len < last_thinking_length {
-                        tracing::debug!("Thinking text shrunk ({} -> {})", last_thinking_length, thinking_len);
-                        last_thinking_length = thinking_len;
-                    }
-
-                    // Track reply deltas
-                    if reply_len > last_reply_length {
-                        let safe_start = if last_reply_length <= reply_len {
-                            let mut pos = last_reply_length;
-                            while pos < reply_len && !reply.is_char_boundary(pos) {
-                                pos += 1;
-                            }
-                            pos
-                        } else {
-                            reply_len
-                        };
-
-                        if safe_start < reply_len {
-                            let delta = &reply[safe_start..];
-                            if !delta.is_empty() {
-                                eprint!("{}", delta);
-                                reply_text.push_str(delta);
-                                if let Some(ref tx) = stream_tx {
-                                    let _ = tx.send(StreamChunk {
-                                        chunk_type: "text".to_string(),
-                                        data: delta.to_string(),
-                                    }).await;
-                                }
-                            }
-                        }
-                        last_reply_length = reply_len;
-                    } else if reply_len < last_reply_length {
-                        tracing::debug!("Reply text shrunk ({} -> {})", last_reply_length, reply_len);
-                        last_reply_length = reply_len;
-                    }
-
-                    // Check stability
-                    if total_len > 0 && total_len == last_total_length {
-                        stable_count += 1;
-                        if stable_count >= 5 {
-                            tracing::info!("Response complete (stable for 5s, poll #{})", poll_idx);
-                            break;
-                        }
-                    } else if total_len != last_total_length {
-                        stable_count = 0;
-                    }
-                    last_total_length = total_len;
-                }
-            }
-        }
-    }
-
-    println!();
-
-    let elapsed = start.elapsed().as_millis() as u64;
-
-    Ok(BrowserChatResult {
-        reply: reply_text,
-        thinking: thinking_text,
-        raw_length: last_total_length,
-        elapsed_ms: elapsed,
-    })
-}
-
-// ─── Public API: Login ────────────────────────────────────────
+// ─── Public API ────────────────────────────────────────────────
 
 /// Login to Z.AI via browser, wait for authentication, and capture cookies
 pub async fn login_via_browser(headless: bool, _cdp_url: Option<&str>) -> Result<ZaiAuthState> {
     tracing::info!("Starting browser login...");
 
+    // Launch Chrome
     let chrome = ChromeProcess::launch(headless)?;
     let _debug_url = chrome.debug_url();
 
+    // Wait for Chrome to be ready
     tokio::time::sleep(Duration::from_secs(2)).await;
 
+    // Get WebSocket URL for the page
     let ws_url = chrome.get_page_ws_url().await?;
     tracing::info!("Chrome CDP WebSocket: {}", ws_url);
 
+    // Connect to CDP
     let mut cdp = CdpConnection::connect(&ws_url).await?;
 
+    // Enable required domains
     cdp.send_notification("Page.enable").await?;
     cdp.send_notification("Network.enable").await?;
     cdp.send_notification("Runtime.enable").await?;
 
+    // Inject anti-detection before navigation
     inject_stealth_via_cdp(&mut cdp).await?;
 
+    // Navigate to Z.AI
     tracing::info!("Navigating to {}...", ZAI_CHAT_URL);
     cdp.navigate(ZAI_CHAT_URL).await?;
 
+    // Wait for page load
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     if !headless {
         tracing::info!("════════════════════════════════════════════════════");
         tracing::info!("  Please login to Z.AI (chat.z.ai) in the browser window.");
+        tracing::info!("  Waiting for authentication...");
         tracing::info!("════════════════════════════════════════════════════");
     }
 
     // Poll for login detection
+    // We wait until we find specific auth cookies that only appear AFTER
+    // the user has actually logged in. We also require the chat page to be
+    // fully loaded (chat input element visible) to avoid false positives
+    // from pre-login page cookies or analytics tokens.
     let mut authenticated = false;
-    let login_start = std::time::Instant::now();
-    let login_timeout = if headless { Duration::from_secs(30) } else { Duration::from_secs(600) };
+    for _ in 0..600 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
-    while login_start.elapsed() < login_timeout {
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        let result = cdp
+            .evaluate(r#"
+                (() => {
+                    const cookieStr = document.cookie;
+                    const currentUrl = window.location.href;
 
-        let result = cdp.evaluate(r#"
-            (() => {
-                const ta = document.querySelector('textarea');
-                const ce = document.querySelector('[contenteditable="true"]');
-                const hasInput = ta !== null || ce !== null;
-                const cookieStr = document.cookie;
-                const hasAuth = cookieStr.includes('token=') || cookieStr.includes('chatglm');
-                return hasInput && hasAuth;
-            })()
-        "#).await;
+                    // Primary check: specific Z.AI auth cookies that only exist after login
+                    // chatglm_refresh_token and chatglm_token are the definitive indicators
+                    const hasZaiRefreshToken = cookieStr.includes("chatglm_refresh_token");
+                    const hasZaiAccessToken = cookieStr.includes("chatglm_token=");
+
+                    // Secondary check: chat page must be loaded with input element
+                    // This ensures we don't detect cookies from the login page itself
+                    const hasChatInput =
+                        document.querySelector('textarea') !== null ||
+                        document.querySelector('[contenteditable="true"]') !== null;
+
+                    // URL check: must be on the chat page, not on login/auth pages
+                    const isOnChatPage =
+                        currentUrl.includes("chat.z.ai") &&
+                        !currentUrl.includes("/login") &&
+                        !currentUrl.includes("/auth");
+
+                    // We need EITHER the specific auth cookies, OR a combination of
+                    // being on the chat page with the chat input visible.
+                    // The chat input alone is not enough (some login pages have textareas),
+                    // but auth cookies + chat page is definitive.
+                    if ((hasZaiRefreshToken || hasZaiAccessToken) && isOnChatPage) {
+                        return true;
+                    }
+
+                    // Also detect if we're on the chat page with a visible chat input
+                    // and the URL no longer has login/auth in it
+                    if (isOnChatPage && hasChatInput &&
+                        (cookieStr.includes("chatglm") || cookieStr.includes("token="))) {
+                        return true;
+                    }
+
+                    return false;
+                })()
+            "#)
+            .await;
 
         if let Ok(val) = result {
             if val.as_bool().unwrap_or(false) {
+                // Extra safety: wait a bit more to ensure cookies are fully set
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 authenticated = true;
                 break;
@@ -1142,6 +517,7 @@ pub async fn login_via_browser(headless: bool, _cdp_url: Option<&str>) -> Result
 
     tracing::info!("Login detected! Capturing cookies...");
 
+    // Get cookies from CDP
     let cdp_cookies = cdp.get_cookies().await?;
     let cookie_string: String = cdp_cookies
         .iter()
@@ -1149,6 +525,7 @@ pub async fn login_via_browser(headless: bool, _cdp_url: Option<&str>) -> Result
         .collect::<Vec<_>>()
         .join("; ");
 
+    // Get user agent
     let ua_result = cdp
         .evaluate("navigator.userAgent")
         .await
@@ -1177,25 +554,37 @@ pub async fn login_via_browser(headless: bool, _cdp_url: Option<&str>) -> Result
     Ok(auth_state)
 }
 
-// ─── Stealth Injection ──────────────────────────────────────────
-
 /// Inject anti-detection scripts via CDP
 async fn inject_stealth_via_cdp(cdp: &mut CdpConnection) -> Result<()> {
     tracing::debug!("Injecting stealth scripts via CDP...");
 
+    // Use Page.addScriptToEvaluateOnNewDocument to run before any page scripts
     cdp.send_command(
         "Page.addScriptToEvaluateOnNewDocument",
         serde_json::json!({
             "source": r#"
+                // Override navigator.webdriver
                 Object.defineProperty(navigator, 'webdriver', { get: () => false });
+
+                // Add chrome runtime mock
                 window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+
+                // Override permissions query
                 const originalQuery = window.navigator.permissions.query;
                 window.navigator.permissions.query = (parameters) =>
                     parameters.name === 'notifications'
                         ? Promise.resolve({ state: Notification.permission })
                         : originalQuery(parameters);
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+
+                // Override plugins length
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5],
+                });
+
+                // Override languages
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['zh-CN', 'zh', 'en'],
+                });
             "#
         }),
     )
@@ -1205,46 +594,538 @@ async fn inject_stealth_via_cdp(cdp: &mut CdpConnection) -> Result<()> {
     Ok(())
 }
 
-// ─── Streaming Types ──────────────────────────────────────────
-
 /// A streaming chunk emitted during browser chat polling
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
-    pub chunk_type: String,
+    pub chunk_type: String, // "thinking" or "text"
     pub data: String,
 }
 
-/// Result of a browser chat operation
-#[derive(Debug, Clone)]
-pub struct BrowserChatResult {
-    pub reply: String,
-    pub thinking: String,
-    pub raw_length: usize,
-    pub elapsed_ms: u64,
-}
-
-// ─── Legacy API (compatibility wrapper) ──────────────────────────
-
-/// Chat with Z.AI via browser automation (legacy API)
+/// Chat with Z.AI via browser automation (primary method)
 ///
-/// This function creates a temporary BrowserSession for a single chat.
-/// For better performance, use BrowserSession directly to reuse Chrome.
+/// This opens chat.z.ai in headless Chrome using the stored cookies for auth,
+/// types a message into the chat input, and polls the DOM for the response.
+/// Supports streaming output by polling the DOM at intervals.
+///
+/// When `stream_tx` is provided, thinking and reply deltas are sent through
+/// the channel in real-time as they are detected in the DOM.
 pub async fn chat_via_browser(
     message: &str,
     auth_state: &ZaiAuthState,
     stream_tx: Option<tokio::sync::mpsc::Sender<StreamChunk>>,
 ) -> Result<BrowserChatResult> {
-    let mut session = BrowserSession::new(auth_state);
-    session.chat(message, stream_tx).await
+    tracing::info!("Starting browser chat...");
+    let start = std::time::Instant::now();
+
+    // Try connecting to an existing Chrome instance on the login CDP port first
+    // Keep chrome process alive for the entire function scope
+    let (ws_url, is_existing, _chrome_guard) = match try_connect_existing_chrome().await {
+        Some(url) => {
+            tracing::info!("Reusing existing Chrome instance");
+            (url, true, None)
+        }
+        None => {
+            // Launch a new headless Chrome with a separate profile
+            let chrome = match ChromeProcess::launch_headless() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("Failed to launch headless Chrome ({}), killing existing Chrome and retrying...", e);
+                    // Kill any lingering Chrome processes that might hold the profile lock
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/f", "/im", "chrome.exe"])
+                        .output();
+                    let _ = std::process::Command::new("killall")
+                        .arg("chrome")
+                        .output();
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    ChromeProcess::launch_headless()?
+                }
+            };
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let url = get_page_ws_url_for_port(ZAI_CDP_PORT_HEADLESS).await?;
+            (url, false, Some(chrome))
+        }
+    };
+
+    let mut cdp = CdpConnection::connect(&ws_url).await?;
+
+    cdp.send_notification("Page.enable").await?;
+    cdp.send_notification("Network.enable").await?;
+    cdp.send_notification("Runtime.enable").await?;
+
+    // Check if we're already on chat.z.ai (reusing login browser)
+    let current_url = cdp.evaluate("window.location.href").await
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    if current_url.contains("chat.z.ai") && is_existing {
+        tracing::info!("Already on chat.z.ai, reusing session");
+    } else {
+        // Inject stealth first
+        inject_stealth_via_cdp(&mut cdp).await?;
+
+        // Navigate to z.ai first (cookies need a domain context)
+        tracing::info!("Navigating to chat.z.ai (first pass for cookies)...");
+        cdp.navigate("https://chat.z.ai").await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Now inject cookies while on the correct domain
+        let mut cookie_count = 0;
+        for cookie_part in auth_state.cookie.split(';') {
+            let trimmed = cookie_part.trim();
+            if let Some(eq_idx) = trimmed.find('=') {
+                let name = &trimmed[..eq_idx];
+                let value = &trimmed[eq_idx + 1..];
+                // Set cookie - try multiple domain formats for maximum compatibility
+                for domain in &[".z.ai", "chat.z.ai", "z.ai"] {
+                    match cdp.set_cookie(name, value, domain, "/").await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!("Failed to set cookie {} for {}: {}", name, domain, e);
+                        }
+                    }
+                }
+                cookie_count += 1;
+            }
+        }
+        tracing::info!("Injected {} cookies via CDP", cookie_count);
+
+        // Verify cookies were actually set
+        let verify_cookies = cdp.evaluate(r#"
+            (() => {
+                return document.cookie.substring(0, 500);
+            })()
+        "#).await;
+        tracing::info!("Cookies after injection: {:?}", verify_cookies);
+
+        // Also set cookies via JavaScript as a fallback (for non-httpOnly cookies)
+        let js_cookie_result = cdp.evaluate(&format!(r#"
+            (() => {{
+                const cookieStr = {:?};
+                const pairs = cookieStr.split('; ');
+                let count = 0;
+                for (const pair of pairs) {{
+                    try {{
+                        document.cookie = pair + '; path=/; domain=.z.ai';
+                        count++;
+                    }} catch(e) {{}}
+                }}
+                return count;
+            }})()
+        "#, auth_state.cookie)).await;
+        tracing::info!("JS cookie injection result: {:?}", js_cookie_result);
+
+        // Reload with cookies now set
+        tracing::info!("Reloading chat.z.ai with cookies...");
+        cdp.navigate(ZAI_CHAT_URL).await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Force a hard reload to ensure the page picks up the new cookies
+        // (SPA may have cached the unauthenticated state)
+        cdp.evaluate("location.reload(true)").await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Verify we're logged in by checking for auth cookies and chat UI
+        let login_check = cdp.evaluate(r#"
+            (() => {
+                const ta = document.querySelector('textarea');
+                const placeholder = ta ? ta.placeholder : '';
+                const cookieStr = document.cookie;
+                const hasAuth = cookieStr.includes('token=') || cookieStr.includes('chatglm');
+                return JSON.stringify({
+                    hasTextarea: ta !== null,
+                    placeholder: placeholder,
+                    hasAuthCookie: hasAuth,
+                    cookiePreview: cookieStr.substring(0, 200),
+                    url: window.location.href,
+                });
+            })()
+        "#).await;
+        tracing::info!("Login check after cookie injection: {:?}", login_check);
+    }
+
+    // Find and type into the textarea using JS (React-compatible)
+    // Safe truncation that respects UTF-8 char boundaries
+    let msg_preview: String = message.chars().take(60).collect();
+    tracing::info!("Sending message: \"{}\"", msg_preview);
+
+    // First, check if we can find the textarea
+    let textarea_check = cdp.evaluate(r#"
+        (() => {
+            const ta = document.querySelector('textarea');
+            const ce = document.querySelector('[contenteditable="true"]');
+            return JSON.stringify({
+                hasTextarea: ta !== null,
+                hasContentEditable: ce !== null,
+                textareaPlaceholder: ta ? ta.placeholder : null,
+                url: window.location.href
+            });
+        })()
+    "#).await?;
+    tracing::info!("Page state: {:?}", textarea_check);
+
+    // Use Input.insertText for reliable text input, then trigger React events
+    // First click on the textarea
+    cdp.evaluate(r#"
+        (() => {
+            const ta = document.querySelector('textarea') || document.querySelector('[contenteditable="true"]');
+            if (ta) { ta.focus(); ta.click(); }
+            return ta ? 'focused' : 'not_found';
+        })()
+    "#).await?;
+
+    // Small delay for focus
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Use Input.insertText to type the message
+    cdp.send_command(
+        "Input.insertText",
+        serde_json::json!({ "text": message }),
+    ).await?;
+
+    // Small delay for React to process
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Check if the textarea has content
+    let textarea_content = cdp.evaluate(r#"
+        (() => {
+            const ta = document.querySelector('textarea');
+            return ta ? ta.value : '';
+        })()
+    "#).await;
+    tracing::info!("Textarea content after insert: {:?}", textarea_content);
+
+    // If textarea is empty, try JavaScript-based input as fallback
+    if let Ok(val) = &textarea_content {
+        let content = val.as_str().unwrap_or("");
+        if content.is_empty() {
+            tracing::warn!("Input.insertText didn't work, trying JS-based input...");
+            // Use React-compatible JS input method
+            let escaped_msg = message.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+            cdp.evaluate(&format!(r#"
+                (() => {{
+                    const ta = document.querySelector('textarea');
+                    if (!ta) return 'no_textarea';
+                    
+                    // Use nativeInputValueSetter to bypass React's controlled input
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLTextAreaElement.prototype, 'value'
+                    ).set;
+                    nativeInputValueSetter.call(ta, "{escaped_msg}");
+                    ta.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    ta.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return ta.value.substring(0, 50);
+                }})()
+            "#)).await?;
+        }
+    }
+
+    // Press Enter key down
+    cdp.send_command(
+        "Input.dispatchKeyEvent",
+        serde_json::json!({
+            "type": "keyDown",
+            "key": "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 13,
+        }),
+    ).await?;
+
+    // Press Enter key up
+    cdp.send_command(
+        "Input.dispatchKeyEvent",
+        serde_json::json!({
+            "type": "keyUp",
+            "key": "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 13,
+        }),
+    ).await?;
+
+    // Wait a moment and check if the message was sent (URL should change to /c/xxx)
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let url_after_enter = cdp.evaluate("window.location.href").await
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    if !url_after_enter.contains("/c/") {
+        tracing::warn!("Enter key didn't submit the message (URL still: {}), trying send button...", url_after_enter);
+        // Try clicking the send button
+        cdp.evaluate(r#"
+            (() => {
+                // Look for a send/submit button near the textarea
+                const btn = document.querySelector('button[type="submit"]') ||
+                    document.querySelector('[class*="send"]') ||
+                    document.querySelector('[aria-label*="send"]') ||
+                    document.querySelector('[aria-label*="Send"]') ||
+                    document.querySelector('form button') ||
+                    // Try finding any button that's a sibling of the textarea
+                    document.querySelector('textarea').closest('form')?.querySelector('button');
+                if (btn) { btn.click(); return 'clicked'; }
+                // Also try submitting the form directly
+                const form = document.querySelector('textarea')?.closest('form');
+                if (form) { form.submit(); return 'form_submitted'; }
+                return 'no_button_found';
+            })()
+        "#).await?;
+    }
+
+    tracing::info!("Message sent, waiting for response...");
+
+    // Wait for the response to start appearing
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Poll for the response, streaming as it comes in
+    let mut reply_text = String::new();
+    let mut thinking_text = String::new();
+    let mut last_thinking_length: usize = 0;
+    let mut last_reply_length: usize = 0;
+    let mut last_total_length: usize = 0;
+    let mut stable_count = 0;
+
+    for poll_idx in 0..120 { // max 2 minutes
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // On first few polls, also log the page structure for debugging
+        if poll_idx < 5 {
+            let debug_info = cdp.evaluate(r#"
+                (() => {
+                    // Inspect the actual DOM structure of z.ai's chat page
+                    // Find all direct children of the main chat area
+                    const allClasses = new Set();
+                    document.querySelectorAll('*').forEach(el => {
+                        el.classList.forEach(c => allClasses.add(c));
+                    });
+                    const classList = [...allClasses].filter(c =>
+                        c.includes('message') || c.includes('chat') || c.includes('think') ||
+                        c.includes('response') || c.includes('answer') || c.includes('assistant') ||
+                        c.includes('markdown') || c.includes('prose') || c.includes('bubble') ||
+                        c.includes('content') || c.includes('reply') || c.includes('agent')
+                    ).sort();
+
+                    // Find the last few elements that might contain the response
+                    const lastElements = [];
+                    document.querySelectorAll('[class*="message"], [class*="response"], [class*="answer"], [class*="think"], [class*="assistant"]').forEach(el => {
+                        if (el.innerText && el.innerText.trim().length > 0 && el.children.length < 3) {
+                            lastElements.push({
+                                tag: el.tagName,
+                                classes: el.className,
+                                textLen: el.innerText.length,
+                                textPreview: el.innerText.substring(0, 50),
+                            });
+                        }
+                    });
+
+                    return JSON.stringify({
+                        relevantClasses: classList.slice(0, 30),
+                        elements: lastElements.slice(-5),
+                        url: window.location.href,
+                    });
+                })()
+            "#).await;
+            tracing::info!("DOM debug (poll #{}): {:?}", poll_idx, debug_info);
+        }
+
+        // Extract thinking and reply text separately from the DOM
+        // Z.AI DOM structure (confirmed from logs):
+        //   - thinking-block: contains the AI's reasoning/thinking text
+        //   - thinking-chain-container: header ("正在思考\n跳过")
+        //   - chat-assistant.markdown-prose: contains ALL text (thinking + reply)
+        //   - user-message: user's sent message
+        // We extract thinking from thinking-block, and reply from chat-assistant
+        // minus thinking sub-elements.
+        let result = cdp.evaluate(r#"
+            (() => {
+                // Extract thinking text from thinking-block elements only
+                let thinkingText = '';
+                document.querySelectorAll('[class*="thinking-block"]').forEach(el => {
+                    thinkingText += el.innerText.trim() + '\n';
+                });
+
+                // Extract reply text: find the LAST chat-assistant container (current conversation)
+                // and remove thinking blocks + user message remnants
+                let replyText = '';
+
+                // Strategy 1: Use chat-assistant class (z.ai's actual DOM structure)
+                // IMPORTANT: Use the LAST element to avoid picking up old conversations
+                const allChatAssistants = document.querySelectorAll('[class*="chat-assistant"]');
+                const chatAssistant = allChatAssistants.length > 0 ? allChatAssistants[allChatAssistants.length - 1] : null;
+                if (chatAssistant) {
+                    const clone = chatAssistant.cloneNode(true);
+                    // Remove thinking-related elements
+                    clone.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="chain-of-thought"]').forEach(el => el.remove());
+                    // Remove user message elements that might be nested inside
+                    clone.querySelectorAll('[class*="user-message"], [class*="edit-user-message"]').forEach(el => el.remove());
+                    replyText = clone.innerText.trim();
+                }
+
+                // Strategy 2: Try markdown-prose class (also use last)
+                if (!replyText) {
+                    const allProse = document.querySelectorAll('[class*="markdown-prose"]');
+                    const prose = allProse.length > 0 ? allProse[allProse.length - 1] : null;
+                    if (prose) {
+                        const clone = prose.cloneNode(true);
+                        clone.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="user-message"]').forEach(el => el.remove());
+                        replyText = clone.innerText.trim();
+                    }
+                }
+
+                // Strategy 3: Find message containers (excluding user messages and thinking)
+                if (!replyText) {
+                    const allMsgs = document.querySelectorAll('[class*="message"]');
+                    for (let i = allMsgs.length - 1; i >= 0; i--) {
+                        const el = allMsgs[i];
+                        const classes = (el.className || '').toLowerCase();
+                        if (classes.includes('user-message')) continue;
+                        if (classes.includes('think') || classes.includes('reasoning')) continue;
+                        const clone = el.cloneNode(true);
+                        clone.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="user-message"]').forEach(e => e.remove());
+                        const text = clone.innerText.trim();
+                        if (text && text.length > 2) { replyText = text; break; }
+                    }
+                }
+
+                // Debug: also return the raw chatAssistant text for comparison
+                let rawAssistantText = '';
+                if (chatAssistant) {
+                    rawAssistantText = chatAssistant.innerText.substring(0, 300);
+                }
+
+                return JSON.stringify({ thinking: thinkingText.trim(), reply: replyText, debug_raw: rawAssistantText });
+            })()
+        "#).await;
+
+        if let Ok(val) = result {
+            if let Some(text) = val.as_str() {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+                    let thinking = parsed["thinking"].as_str().unwrap_or("");
+                    let reply = parsed["reply"].as_str().unwrap_or("");
+
+                    let thinking_len = thinking.len();
+                    let reply_len = reply.len();
+                    let total_len = thinking_len + reply_len;
+
+                    // Track thinking deltas
+                    if thinking_len > last_thinking_length {
+                        // Find safe UTF-8 char boundary
+                        let safe_start = if last_thinking_length <= thinking_len {
+                            let mut pos = last_thinking_length;
+                            while pos < thinking_len && !thinking.is_char_boundary(pos) {
+                                pos += 1;
+                            }
+                            pos
+                        } else {
+                            thinking_len
+                        };
+
+                        if safe_start < thinking_len {
+                            let delta = &thinking[safe_start..];
+                            if !delta.is_empty() {
+                                eprint!("\x1b[90m{}\x1b[0m", delta); // gray for thinking
+                                thinking_text.push_str(delta);
+                                // Send thinking delta through channel
+                                if let Some(ref tx) = stream_tx {
+                                    let _ = tx.send(StreamChunk {
+                                        chunk_type: "thinking".to_string(),
+                                        data: delta.to_string(),
+                                    }).await;
+                                }
+                            }
+                        }
+                        last_thinking_length = thinking_len;
+                    } else if thinking_len < last_thinking_length {
+                        // Thinking text shrank (likely collapsed/hidden by React)
+                        tracing::debug!("Thinking text shrunk ({} -> {}), DOM update", last_thinking_length, thinking_len);
+                        last_thinking_length = thinking_len;
+                    }
+
+                    // Track reply deltas
+                    if reply_len > last_reply_length {
+                        // Find safe UTF-8 char boundary
+                        let safe_start = if last_reply_length <= reply_len {
+                            let mut pos = last_reply_length;
+                            while pos < reply_len && !reply.is_char_boundary(pos) {
+                                pos += 1;
+                            }
+                            pos
+                        } else {
+                            reply_len
+                        };
+
+                        if safe_start < reply_len {
+                            let delta = &reply[safe_start..];
+                            if !delta.is_empty() {
+                                eprint!("{}", delta);
+                                reply_text.push_str(delta);
+                                // Send text delta through channel
+                                if let Some(ref tx) = stream_tx {
+                                    let _ = tx.send(StreamChunk {
+                                        chunk_type: "text".to_string(),
+                                        data: delta.to_string(),
+                                    }).await;
+                                }
+                            }
+                        }
+                        last_reply_length = reply_len;
+                    } else if reply_len < last_reply_length {
+                        // Reply text shrank (React re-render)
+                        tracing::debug!("Reply text shrunk ({} -> {}), likely React re-render", last_reply_length, reply_len);
+                        last_reply_length = reply_len;
+                    }
+
+                    // Check stability based on total content length
+                    if total_len > 0 && total_len == last_total_length {
+                        stable_count += 1;
+                        if stable_count >= 5 {
+                            tracing::info!("Response complete (stable for 5s, poll #{})", poll_idx);
+                            break;
+                        }
+                    } else if total_len != last_total_length {
+                        stable_count = 0;
+                    }
+                    last_total_length = total_len;
+                }
+            }
+        }
+    }
+
+    println!();
+
+    let elapsed = start.elapsed().as_millis() as u64;
+
+    Ok(BrowserChatResult {
+        reply: reply_text,
+        thinking: thinking_text,
+        raw_length: last_total_length,
+        elapsed_ms: elapsed,
+    })
 }
 
-// ─── Helper Functions ──────────────────────────────────────────
+/// Try to connect to an already running Chrome instance on the default CDP port
+async fn try_connect_existing_chrome() -> Option<String> {
+    let ws_url = get_page_ws_url_for_port(ZAI_CDP_PORT).await.ok()?;
+    // Replace localhost with 127.0.0.1 to avoid IPv6 issues on Windows
+    let ws_url = ws_url.replace("localhost", "127.0.0.1");
+    // Verify the connection works
+    let mut cdp = CdpConnection::connect(&ws_url).await.ok()?;
+    let result = cdp.evaluate("1+1").await.ok()?;
+    if result.as_u64() == Some(2) {
+        Some(ws_url)
+    } else {
+        None
+    }
+}
 
 /// Get page WebSocket URL for a specific CDP port (with retry)
 async fn get_page_ws_url_for_port(port: u16) -> Result<String> {
     let json_url = format!("http://127.0.0.1:{}/json", port);
     let client = reqwest::Client::new();
 
+    // Retry up to 20 times (10 seconds total)
     for attempt in 0..20 {
         match client.get(&json_url).send().await {
             Ok(res) if res.status().is_success() => {
@@ -1277,6 +1158,16 @@ async fn get_page_ws_url_for_port(port: u16) -> Result<String> {
     bail!("Chrome did not start on port {} after 10 seconds", port)
 }
 
+#[derive(Debug, Clone)]
+pub struct BrowserChatResult {
+    pub reply: String,
+    pub thinking: String,
+    pub raw_length: usize,
+    pub elapsed_ms: u64,
+}
+
+// ─── Helpers ──────────────────────────────────────────────────
+
 /// Find Chrome executable path
 fn which_chrome() -> Result<std::path::PathBuf> {
     let candidates = if cfg!(target_os = "windows") {
@@ -1301,6 +1192,7 @@ fn which_chrome() -> Result<std::path::PathBuf> {
         }
     }
 
+    // Try to find agent-browser bundled Chrome dynamically
     if let Ok(entries) = std::fs::read_dir("/home/z/.agent-browser/browsers/") {
         for entry in entries.flatten() {
             let dir = entry.path();
@@ -1314,6 +1206,7 @@ fn which_chrome() -> Result<std::path::PathBuf> {
         }
     }
 
+    // Try PATH lookup
     for cmd in &["chrome", "chromium-browser", "chromium", "google-chrome"] {
         #[cfg(windows)]
         {
@@ -1339,17 +1232,20 @@ fn which_chrome() -> Result<std::path::PathBuf> {
         }
     }
 
-    bail!("Chrome/Chromium not found. Please install Chrome or set CDP_URL.")
+    bail!(
+        "Chrome/Chromium not found. Please install Chrome or set CDP_URL to connect to an existing instance."
+    )
 }
 
 /// Find an available TCP port for CDP
-#[allow(dead_code)]
 fn find_available_port() -> u16 {
+    // Try common CDP ports first
     for port in [9222, 9223, 9224, 9225, 9226, 9227, 9228, 9229] {
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
     }
+    // Use OS-assigned port
     if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") {
         if let Ok(addr) = listener.local_addr() {
             return addr.port();
