@@ -569,14 +569,17 @@ impl BrowserSession {
         "#).await;
         tracing::info!("Login check after cookie injection: {:?}", login_check);
 
-        // Switch to Agent mode (better for automated tasks, has web search & tool use)
-        // The sidebar has "Chat 模式" (active) and "Agent 模式" buttons
+        // Note: The Agent/Chat mode toggle has been removed from chat.z.ai's UI
+        // as of 2026-06. The site now uses a unified chat interface.
+        // Previously, there were "Chat 模式" and "Agent 模式" buttons in the sidebar.
+        // If the toggle returns in the future, we can re-enable this logic.
         let agent_mode_result = cdp.evaluate(r#"
             (() => {
-                // Find the "Agent 模式" button in the sidebar
+                // Check if Agent mode toggle exists
                 const buttons = document.querySelectorAll('button');
                 for (const btn of buttons) {
-                    if (btn.innerText && btn.innerText.includes('Agent') && btn.innerText.includes('模式')) {
+                    const text = btn.innerText || '';
+                    if (text.includes('Agent') && (text.includes('模式') || text.includes('mode') || text.includes('Mode'))) {
                         const isActive = btn.getAttribute('data-active') === 'true';
                         if (!isActive) {
                             btn.click();
@@ -585,11 +588,11 @@ impl BrowserSession {
                         return 'already in Agent mode';
                     }
                 }
-                return 'Agent mode button not found';
+                return 'Agent mode button not found (expected - UI updated)';
             })()
         "#).await;
         tracing::info!("Agent mode switch: {:?}", agent_mode_result);
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         self.initialized = true;
         Ok(())
@@ -630,35 +633,21 @@ impl BrowserSession {
             let on_chat_page = current_url.contains("chat.z.ai");
 
             if on_chat_page {
-                // Ensure we're in Agent mode before starting a new conversation
-                let current_mode = cdp.evaluate(r#"
+                // Note: Agent/Chat mode toggle removed from chat.z.ai UI (2026-06).
+                // The site now uses a unified chat interface.
+                // If the toggle is present in the future, click it.
+                let _current_mode = cdp.evaluate(r#"
                     (() => {
                         const buttons = document.querySelectorAll('button');
                         for (const btn of buttons) {
-                            if (btn.innerText && btn.innerText.includes('Agent') && btn.innerText.includes('模式')) {
+                            const text = btn.innerText || '';
+                            if (text.includes('Agent') && (text.includes('模式') || text.includes('mode') || text.includes('Mode'))) {
                                 return btn.getAttribute('data-active') === 'true' ? 'agent' : 'chat';
                             }
                         }
-                        return 'unknown';
+                        return 'unified';
                     })()
                 "#).await.ok().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
-                
-                if current_mode != "agent" {
-                    tracing::info!("Not in Agent mode (current: {}), switching...", current_mode);
-                    cdp.evaluate(r#"
-                        (() => {
-                            const buttons = document.querySelectorAll('button');
-                            for (const btn of buttons) {
-                                if (btn.innerText && btn.innerText.includes('Agent') && btn.innerText.includes('模式')) {
-                                    btn.click();
-                                    return 'switched';
-                                }
-                            }
-                            return 'not found';
-                        })()
-                    "#).await?;
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
                 
                 // Navigate to root URL to start a new conversation
                 tracing::info!("Starting new conversation on existing session...");
@@ -758,10 +747,19 @@ async fn type_message_and_poll(
     "#).await?;
     tracing::info!("Page state: {:?}", textarea_check);
 
+    // ─── Input Strategy ─────────────────────────────────────────
+    // chat.z.ai uses React with a controlled textarea. The send button
+    // (type="submit") is disabled until React's state sees content.
+    // CDP Input.insertText sets the value but does NOT trigger React's
+    // onChange/input events, so the button stays disabled and Enter
+    // key submission also fails. We must use JS-based input with
+    // nativeInputValueSetter + dispatched events to activate the button.
+    // ────────────────────────────────────────────────────────────────
+
     // Click on the textarea to focus it
     cdp.evaluate(r#"
         (() => {
-            const ta = document.querySelector('textarea') || document.querySelector('[contenteditable="true"]');
+            const ta = document.querySelector('textarea');
             if (ta) { ta.focus(); ta.click(); }
             return ta ? 'focused' : 'not_found';
         })()
@@ -770,60 +768,80 @@ async fn type_message_and_poll(
     // Small delay for focus
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Clear any existing content in the textarea (important for session reuse)
-    cdp.evaluate(r#"
-        (() => {
+    // Use JS-based input with React-compatible event dispatch
+    // This sets the value via the native setter and fires input/change
+    // events so React picks up the change and enables the submit button.
+    let escaped_msg = message.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "");
+    let input_result = cdp.evaluate(&format!(r#"
+        (() => {{
             const ta = document.querySelector('textarea');
-            if (ta) {
-                ta.focus();
-                ta.select();
-            }
-            return 'cleared';
-        })()
-    "#).await?;
+            if (!ta) return 'no_textarea';
 
-    // Use Input.insertText to type the message
-    cdp.send_command(
-        "Input.insertText",
-        serde_json::json!({ "text": message }),
-    ).await?;
+            // Clear existing content
+            ta.focus();
+            ta.select();
+
+            // Set value via React-compatible native setter
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLTextAreaElement.prototype, 'value'
+            ).set;
+            nativeInputValueSetter.call(ta, "{escaped_msg}");
+
+            // Dispatch React-compatible events
+            ta.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            ta.dispatchEvent(new Event('change', {{ bubbles: true }}));
+
+            // Also dispatch InputEvent for good measure
+            ta.dispatchEvent(new InputEvent('input', {{
+                bubbles: true,
+                cancelable: false,
+                inputType: 'insertText',
+                data: "{escaped_msg}"
+            }}));
+
+            return JSON.stringify({{ value: ta.value.substring(0, 50), len: ta.value.length }});
+        }})()
+    "#)).await?;
+    tracing::info!("JS input result: {:?}", input_result);
 
     // Small delay for React to process
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Check if the textarea has content
-    let textarea_content = cdp.evaluate(r#"
+    // Verify textarea has content and the send button is enabled
+    let send_check = cdp.evaluate(r#"
         (() => {
             const ta = document.querySelector('textarea');
-            return ta ? ta.value : '';
+            const taValue = ta ? ta.value : '';
+
+            // Check the submit button state
+            const sendDiv = document.querySelector('[aria-label="Send Message"]');
+            const sendBtn = sendDiv ? sendDiv.querySelector('button') : null;
+            const btnDisabled = sendBtn ? sendBtn.disabled : 'no_btn';
+            const btnType = sendBtn ? sendBtn.type : 'no_btn';
+
+            // Also check for Stop button (means message already sent)
+            const stopDivs = [...document.querySelectorAll('[aria-label]')].filter(
+                el => el.getAttribute('aria-label').includes('Stop')
+            );
+
+            return JSON.stringify({
+                taValue: taValue.substring(0, 50),
+                taLen: taValue.length,
+                btnDisabled: btnDisabled,
+                btnType: btnType,
+                hasStopBtn: stopDivs.length > 0,
+            });
         })()
     "#).await;
-    tracing::info!("Textarea content after insert: {:?}", textarea_content);
+    tracing::info!("Send button check: {:?}", send_check);
 
-    // If textarea is empty, try JavaScript-based input as fallback
-    if let Ok(val) = &textarea_content {
-        let content = val.as_str().unwrap_or("");
-        if content.is_empty() {
-            tracing::warn!("Input.insertText didn't work, trying JS-based input...");
-            let escaped_msg = message.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
-            cdp.evaluate(&format!(r#"
-                (() => {{
-                    const ta = document.querySelector('textarea');
-                    if (!ta) return 'no_textarea';
-                    
-                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                        window.HTMLTextAreaElement.prototype, 'value'
-                    ).set;
-                    nativeInputValueSetter.call(ta, "{escaped_msg}");
-                    ta.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    ta.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    return ta.value.substring(0, 50);
-                }})()
-            "#)).await?;
-        }
-    }
+    // ─── Submit Strategy ────────────────────────────────────────
+    // The form has a button[type=submit] inside a div[aria-label="Send Message"].
+    // If the button is enabled (React saw the input), pressing Enter or
+    // clicking it will submit. If still disabled, force-click the button.
+    // ────────────────────────────────────────────────────────────────
 
-    // Press Enter to send
+    // Try pressing Enter first
     cdp.send_command(
         "Input.dispatchKeyEvent",
         serde_json::json!({
@@ -848,27 +866,96 @@ async fn type_message_and_poll(
 
     // Wait and check if message was sent
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    let url_after_enter = cdp.evaluate("window.location.href").await
-        .ok()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_default();
 
-    if !url_after_enter.contains("/c/") {
-        tracing::warn!("Enter key didn't submit (URL: {}), trying send button...", url_after_enter);
-        cdp.evaluate(r#"
+    // Check if the page shows a response (conversation started)
+    // The URL may or may not change to /c/xxx depending on the page state.
+    // Better indicator: check if the textarea placeholder changed from
+    // "How can I help you today?" to "Send a Message", or if a Stop
+    // button appeared.
+    let sent_check = cdp.evaluate(r#"
+        (() => {
+            const ta = document.querySelector('textarea');
+            const placeholder = ta ? ta.placeholder : '';
+            const taValue = ta ? ta.value : '';
+
+            // Check for Stop button (appears while AI is thinking)
+            const stopDivs = [...document.querySelectorAll('[aria-label]')].filter(
+                el => el.getAttribute('aria-label').includes('Stop')
+            );
+
+            // Check for Thinking button (appears while AI is thinking)
+            const thinkingBtns = [...document.querySelectorAll('button')].filter(
+                b => b.innerText.includes('Thinking') || b.innerText.includes('thinking')
+            );
+
+            // Check for user-message div (means message was posted)
+            const userMsg = document.querySelector('[class*="user-message"]');
+
+            // Check URL
+            const url = window.location.href;
+
+            return JSON.stringify({
+                placeholder: placeholder,
+                taValue: taValue.substring(0, 50),
+                hasStopBtn: stopDivs.length > 0,
+                hasThinkingBtn: thinkingBtns.length > 0,
+                hasUserMessage: userMsg !== null,
+                url: url,
+            });
+        })()
+    "#).await;
+    tracing::info!("After Enter - sent check: {:?}", sent_check);
+
+    // If message wasn't sent, try the submit button approach
+    let sent = if let Ok(val) = &sent_check {
+        if let Some(text) = val.as_str() {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+                parsed["hasStopBtn"].as_bool().unwrap_or(false)
+                    || parsed["hasThinkingBtn"].as_bool().unwrap_or(false)
+                    || parsed["hasUserMessage"].as_bool().unwrap_or(false)
+                    || parsed["url"].as_str().map(|u| u.contains("/c/")).unwrap_or(false)
+            } else { false }
+        } else { false }
+    } else { false };
+
+    if !sent {
+        tracing::warn!("Enter key didn't submit, trying send button click...");
+
+        // Try clicking the submit button directly via JS (force even if disabled)
+        let click_result = cdp.evaluate(r#"
             (() => {
-                const btn = document.querySelector('button[type="submit"]') ||
-                    document.querySelector('[class*="send"]') ||
-                    document.querySelector('[aria-label*="send"]') ||
-                    document.querySelector('[aria-label*="Send"]') ||
-                    document.querySelector('form button') ||
-                    document.querySelector('textarea').closest('form')?.querySelector('button');
-                if (btn) { btn.click(); return 'clicked'; }
-                const form = document.querySelector('textarea')?.closest('form');
-                if (form) { form.submit(); return 'form_submitted'; }
+                // Find the submit button in the Send Message container
+                const sendDiv = document.querySelector('[aria-label="Send Message"]');
+                const sendBtn = sendDiv ? sendDiv.querySelector('button[type="submit"]') : null;
+
+                if (sendBtn) {
+                    // Remove disabled attribute to force enable
+                    sendBtn.removeAttribute('disabled');
+                    sendBtn.click();
+                    return 'clicked_submit';
+                }
+
+                // Fallback: try other selectors
+                const btn = document.querySelector('button[type="submit"]');
+                if (btn) {
+                    btn.removeAttribute('disabled');
+                    btn.click();
+                    return 'clicked_generic_submit';
+                }
+
+                // Last resort: submit the form directly
+                const form = document.querySelector('form');
+                if (form) {
+                    // Create and dispatch a submit event
+                    const submitEvent = new Event('submit', { bubbles: true, cancelable: true });
+                    form.dispatchEvent(submitEvent);
+                    return 'form_dispatched';
+                }
+
                 return 'no_button_found';
             })()
         "#).await?;
+        tracing::info!("Send button click result: {:?}", click_result);
     }
 
     tracing::info!("Message sent, waiting for response...");
@@ -925,48 +1012,96 @@ async fn type_message_and_poll(
         }
 
         // Extract thinking and reply text
+        // Current chat.z.ai DOM structure (as of 2026-06):
+        //   div.chat-assistant.markdown-prose > div > div#response-content-container
+        //     > div.markdown-prose
+        //       > div.thinking-chain-container (thinking/chain-of-thought)
+        //       > p (reply paragraphs)
+        //   div.user-message (user's sent message)
         let result = cdp.evaluate(r#"
             (() => {
                 let thinkingText = '';
+
+                // ─── Extract thinking text ─────────────────────────────
+                // The thinking chain is inside thinking-chain-container divs.
+                // Also check for the "Thinking..." button state (during active thinking).
+                const thinkingContainers = document.querySelectorAll('[class*="thinking-chain"]');
+                thinkingContainers.forEach(el => {
+                    // Get the full text content of the thinking chain
+                    const text = el.innerText.trim();
+                    if (text && text !== 'Thought Process' && text !== 'Thinking...') {
+                        thinkingText += text + '\n';
+                    }
+                });
+
+                // Also check for the older thinking-block class (for backward compat)
                 document.querySelectorAll('[class*="thinking-block"]').forEach(el => {
                     thinkingText += el.innerText.trim() + '\n';
                 });
 
                 let replyText = '';
-                const allChatAssistants = document.querySelectorAll('[class*="chat-assistant"]');
-                const chatAssistant = allChatAssistants.length > 0 ? allChatAssistants[allChatAssistants.length - 1] : null;
-                if (chatAssistant) {
-                    const clone = chatAssistant.cloneNode(true);
-                    clone.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="chain-of-thought"]').forEach(el => el.remove());
-                    clone.querySelectorAll('[class*="user-message"], [class*="edit-user-message"]').forEach(el => el.remove());
-                    replyText = clone.innerText.trim();
-                }
 
-                if (!replyText) {
-                    const allProse = document.querySelectorAll('[class*="markdown-prose"]');
-                    const prose = allProse.length > 0 ? allProse[allProse.length - 1] : null;
-                    if (prose) {
-                        const clone = prose.cloneNode(true);
-                        clone.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="user-message"]').forEach(el => el.remove());
+                // ─── Strategy 1: Extract from #response-content-container ──
+                // This is the most reliable container for the AI response.
+                const rcc = document.querySelector('#response-content-container');
+                if (rcc) {
+                    const innerProse = rcc.querySelector('[class*="markdown-prose"]');
+                    if (innerProse) {
+                        const clone = innerProse.cloneNode(true);
+                        // Remove thinking chain from the clone
+                        clone.querySelectorAll('[class*="thinking-chain"], [class*="thinking-block"], [class*="chain-of-thought"]').forEach(el => el.remove());
+                        // Remove user message elements
+                        clone.querySelectorAll('[class*="user-message"], [class*="edit-user-message"]').forEach(el => el.remove());
                         replyText = clone.innerText.trim();
                     }
                 }
 
+                // ─── Strategy 2: Extract from chat-assistant ────────────
+                if (!replyText) {
+                    const allChatAssistants = document.querySelectorAll('[class*="chat-assistant"]');
+                    const chatAssistant = allChatAssistants.length > 0 ? allChatAssistants[allChatAssistants.length - 1] : null;
+                    if (chatAssistant) {
+                        const clone = chatAssistant.cloneNode(true);
+                        clone.querySelectorAll('[class*="thinking-chain"], [class*="thinking-block"], [class*="think"], [class*="reasoning"], [class*="chain-of-thought"]').forEach(el => el.remove());
+                        clone.querySelectorAll('[class*="user-message"], [class*="edit-user-message"], [class*="chat-user"]').forEach(el => el.remove());
+                        replyText = clone.innerText.trim();
+                    }
+                }
+
+                // ─── Strategy 3: Fallback - look for paragraph elements ──
+                // The reply text is typically in <p> tags after the thinking chain.
+                if (!replyText) {
+                    const rcc2 = document.querySelector('#response-content-container');
+                    if (rcc2) {
+                        const paragraphs = rcc2.querySelectorAll('p');
+                        const texts = [];
+                        paragraphs.forEach(p => {
+                            const text = p.innerText.trim();
+                            if (text && text.length > 0) texts.push(text);
+                        });
+                        replyText = texts.join('\n');
+                    }
+                }
+
+                // ─── Strategy 4: Last resort - look for any message element ──
                 if (!replyText) {
                     const allMsgs = document.querySelectorAll('[class*="message"]');
                     for (let i = allMsgs.length - 1; i >= 0; i--) {
                         const el = allMsgs[i];
                         const classes = (el.className || '').toLowerCase();
                         if (classes.includes('user-message')) continue;
+                        if (classes.includes('messageInputContainer')) continue;
                         if (classes.includes('think') || classes.includes('reasoning')) continue;
                         const clone = el.cloneNode(true);
-                        clone.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="user-message"]').forEach(e => e.remove());
+                        clone.querySelectorAll('[class*="thinking-chain"], [class*="thinking-block"], [class*="think"], [class*="reasoning"], [class*="user-message"]').forEach(e => e.remove());
                         const text = clone.innerText.trim();
                         if (text && text.length > 2) { replyText = text; break; }
                     }
                 }
 
                 let rawAssistantText = '';
+                const allChatAssistants = document.querySelectorAll('[class*="chat-assistant"]');
+                const chatAssistant = allChatAssistants.length > 0 ? allChatAssistants[allChatAssistants.length - 1] : null;
                 if (chatAssistant) {
                     rawAssistantText = chatAssistant.innerText.substring(0, 300);
                 }
