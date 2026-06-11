@@ -665,89 +665,59 @@ impl AgentRuntime {
             }
         }
 
-        // Send "thinking" stream chunk to show we're processing
-        self.send_stream_chunk(ws, from_id, "thinking", "💭").await;
-
-        // Use browser chat with streaming for real-time AICQ delivery
+        // Use browser chat (no streaming channel — we collect the full result and send as one message)
         tracing::info!("🤖 Generating reply via browser chat for: \"{}\"...", content.chars().take(60).collect::<String>());
 
         let auth_state = auth::load_auth();
         match auth_state {
             Some(auth) => {
-                // Create streaming channel
-                let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(100);
                 let msg_owned = content.to_string();
 
-                // Spawn browser chat task
-                let browser_handle = tokio::spawn(async move {
-                    crate::browser::chat_via_browser(&msg_owned, &auth, Some(stream_tx)).await
-                });
+                // Run browser chat WITHOUT streaming channel — just get the final result
+                let browser_result = crate::browser::chat_via_browser(&msg_owned, &auth, None).await;
 
-                // Forward stream chunks to AICQ in real-time
-                let mut thinking_sent = false;
-                while let Some(chunk) = stream_rx.recv().await {
-                    match chunk.chunk_type.as_str() {
-                        "thinking" => {
-                            thinking_sent = true;
-                            self.send_stream_chunk(ws, from_id, "thinking", &chunk.data).await;
-                        }
-                        "text" => {
-                            if thinking_sent {
-                                // First text chunk after thinking — send reasoning_end
-                                self.send_stream_chunk(ws, from_id, "reasoning_end", "").await;
-                                thinking_sent = false;
+                match browser_result {
+                    Ok(result) => {
+                        if !result.reply.is_empty() {
+                            // Build the full message: include thinking if present
+                            let full_reply = if !result.thinking.is_empty() {
+                                format!(
+                                    "💭 **思考过程：**\n{}\n\n---\n\n{}",
+                                    result.thinking.trim(),
+                                    result.reply.trim()
+                                )
+                            } else {
+                                result.reply.clone()
+                            };
+
+                            // Send as a single complete message (most reliable for AICQ)
+                            self.send_message(ws, from_id, &full_reply).await;
+
+                            tracing::info!("✅ Reply sent via browser (thinking: {} chars, reply: {} chars)",
+                                result.thinking.len(), result.reply.len());
+
+                            // Save reply to memory
+                            let mut memory = self.memory.lock().await;
+                            if let Some(history) = memory.get_mut(from_id) {
+                                history.push(ConversationMessage {
+                                    role: "assistant".to_string(),
+                                    content: result.reply,
+                                });
                             }
-                            self.send_stream_chunk(ws, from_id, "text", &chunk.data).await;
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Wait for browser chat to complete
-                match browser_handle.await {
-                    Ok(Ok(browser_result)) => {
-                        // Send reasoning_end if we had thinking but haven't sent it yet
-                        if !browser_result.thinking.is_empty() && thinking_sent {
-                            self.send_stream_chunk(ws, from_id, "reasoning_end", "").await;
-                        }
-
-                        // If no text was streamed (empty reply detected), send what we have
-                        if !browser_result.reply.is_empty() {
-                            self.send_stream_end(ws, from_id).await;
-                            self.send_message(ws, from_id, &browser_result.reply).await;
                         } else {
-                            self.send_stream_chunk(ws, from_id, "text", "抱歉，未能获取到回复。").await;
-                            self.send_stream_end(ws, from_id).await;
-                        }
-
-                        tracing::info!("✅ Reply sent via browser (thinking: {} chars, reply: {} chars)", 
-                            browser_result.thinking.len(), browser_result.reply.len());
-
-                        // Save to memory
-                        let mut memory = self.memory.lock().await;
-                        if let Some(history) = memory.get_mut(from_id) {
-                            history.push(ConversationMessage {
-                                role: "assistant".to_string(),
-                                content: browser_result.reply,
-                            });
+                            self.send_message(ws, from_id, "抱歉，未能获取到回复。请稍后再试。").await;
+                            tracing::warn!("⚠️ Empty reply from browser chat");
                         }
                     }
-                    Ok(Err(be)) => {
+                    Err(be) => {
                         tracing::error!("❌ Browser chat failed: {}", be);
-                        self.send_stream_chunk(ws, from_id, "text", "抱歉，生成回复时出错了。请稍后再试。").await;
-                        self.send_stream_end(ws, from_id).await;
-                    }
-                    Err(e) => {
-                        tracing::error!("❌ Browser chat task panicked: {}", e);
-                        self.send_stream_chunk(ws, from_id, "text", "抱歉，生成回复时出错了。请稍后再试。").await;
-                        self.send_stream_end(ws, from_id).await;
+                        self.send_message(ws, from_id, "抱歉，生成回复时出错了。请稍后再试。").await;
                     }
                 }
             }
             None => {
                 tracing::error!("❌ No auth state - run zair login first");
-                self.send_stream_chunk(ws, from_id, "text", "抱歉，生成回复时出错了。请先运行 zair login。").await;
-                self.send_stream_end(ws, from_id).await;
+                self.send_message(ws, from_id, "抱歉，生成回复时出错了。请先运行 zair login。").await;
             }
         }
 
