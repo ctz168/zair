@@ -1084,48 +1084,39 @@ async fn type_message_and_poll(
                 // ─── Extract thinking text ─────────────────────────────
                 // The thinking chain is inside thinking-chain-container divs.
                 // Also check for the "Thinking..." button state (during active thinking).
-                const thinkingContainers = document.querySelectorAll('[class*="thinking-chain"]');
-                thinkingContainers.forEach(el => {
-                    // Try to click the thinking chain header to expand it (reveal hidden steps)
-                    try {
-                        const header = el.querySelector('button, [role="button"], [class*="header"], [class*="toggle"]');
-                        if (header) header.click();
-                    } catch(e) {}
-                    
-                    // Use textContent to capture hidden/collapsed thinking content
-                    // innerText skips hidden elements, but textContent captures all
-                    const allText = el.textContent.trim();
-                    const visibleText = el.innerText.trim();
-                    
-                    // Prefer textContent if it's longer (contains hidden thinking steps)
-                    let text = allText.length > visibleText.length ? allText : visibleText;
-                    
-                    // Filter out pure placeholder/header texts
-                    const placeholders = ['Thought Process', 'Thinking...', '正在思考', '跳过', 
-                        '正在思考\n跳过', '跳过\n正在思考', '思考过程', '思考'];
-                    if (text && !placeholders.includes(text)) {
-                        // Remove "思考过程" header prefix if present
-                        text = text.replace(/^思考过程[\s\n]*/, '');
-                        if (text.trim()) {
-                            thinkingText += text.trim() + '\n';
+                // ─── Strategy 1: Extract thinking from thinking-block (visible, contains actual reasoning) ──
+                // chat.z.ai renders thinking steps in .thinking-block elements which are VISIBLE.
+                // The .thinking-chain-container just shows a collapsed summary like "思考过程".
+                // Always use innerText (NOT textContent) so stability detection works correctly.
+                const thinkingBlocks = document.querySelectorAll('[class*="thinking-block"]');
+                const placeholders = ['Thought Process', 'Thinking...', '正在思考', '跳过', 
+                    '正在思考\n跳过', '跳过\n正在思考', '思考过程', '思考'];
+                
+                if (thinkingBlocks.length > 0) {
+                    // thinking-block elements contain the actual visible reasoning text
+                    thinkingBlocks.forEach(el => {
+                        const text = el.innerText.trim();
+                        if (text && !placeholders.includes(text) && text.length > 2) {
+                            thinkingText += text + '\n';
                         }
-                    }
-                });
-
-                // Also check for the older thinking-block class (for backward compat)
-                document.querySelectorAll('[class*="thinking-block"]').forEach(el => {
-                    const allText = el.textContent.trim();
-                    const visibleText = el.innerText.trim();
-                    let text = allText.length > visibleText.length ? allText : visibleText;
-                    const placeholders = ['Thought Process', 'Thinking...', '正在思考', '跳过',
-                        '正在思考\n跳过', '跳过\n正在思考', '思考过程', '思考'];
-                    if (text && !placeholders.includes(text)) {
-                        text = text.replace(/^思考过程[\s\n]*/, '');
-                        if (text.trim()) {
-                            thinkingText += text.trim() + '\n';
+                    });
+                }
+                
+                // ─── Strategy 2: Fallback to thinking-chain-container ──
+                if (!thinkingText) {
+                    const thinkingContainers = document.querySelectorAll('[class*="thinking-chain"]');
+                    thinkingContainers.forEach(el => {
+                        const text = el.innerText.trim();
+                        // Filter out pure placeholders
+                        if (text && !placeholders.includes(text) && text.length > 2) {
+                            // Remove "思考过程" header prefix if present
+                            const cleaned = text.replace(/^思考过程[\s\n]*/, '');
+                            if (cleaned.trim() && !placeholders.includes(cleaned.trim())) {
+                                thinkingText += cleaned.trim() + '\n';
+                            }
                         }
-                    }
-                });
+                    });
+                }
 
                 let replyText = '';
 
