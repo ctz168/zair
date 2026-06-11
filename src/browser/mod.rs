@@ -594,16 +594,27 @@ async fn inject_stealth_via_cdp(cdp: &mut CdpConnection) -> Result<()> {
     Ok(())
 }
 
-/// Chat with Z.AI via browser automation (fallback when API is blocked)
+/// A streaming chunk emitted during browser chat polling
+#[derive(Debug, Clone)]
+pub struct StreamChunk {
+    pub chunk_type: String, // "thinking" or "text"
+    pub data: String,
+}
+
+/// Chat with Z.AI via browser automation (primary method)
 ///
 /// This opens chat.z.ai in headless Chrome using the stored cookies for auth,
 /// types a message into the chat input, and polls the DOM for the response.
 /// Supports streaming output by polling the DOM at intervals.
+///
+/// When `stream_tx` is provided, thinking and reply deltas are sent through
+/// the channel in real-time as they are detected in the DOM.
 pub async fn chat_via_browser(
     message: &str,
     auth_state: &ZaiAuthState,
+    stream_tx: Option<tokio::sync::mpsc::Sender<StreamChunk>>,
 ) -> Result<BrowserChatResult> {
-    tracing::info!("Starting browser chat (API fallback)...");
+    tracing::info!("Starting browser chat...");
     let start = std::time::Instant::now();
 
     // Try connecting to an existing Chrome instance on the login CDP port first
@@ -1003,6 +1014,13 @@ pub async fn chat_via_browser(
                             if !delta.is_empty() {
                                 eprint!("\x1b[90m{}\x1b[0m", delta); // gray for thinking
                                 thinking_text.push_str(delta);
+                                // Send thinking delta through channel
+                                if let Some(ref tx) = stream_tx {
+                                    let _ = tx.send(StreamChunk {
+                                        chunk_type: "thinking".to_string(),
+                                        data: delta.to_string(),
+                                    }).await;
+                                }
                             }
                         }
                         last_thinking_length = thinking_len;
@@ -1030,6 +1048,13 @@ pub async fn chat_via_browser(
                             if !delta.is_empty() {
                                 eprint!("{}", delta);
                                 reply_text.push_str(delta);
+                                // Send text delta through channel
+                                if let Some(ref tx) = stream_tx {
+                                    let _ = tx.send(StreamChunk {
+                                        chunk_type: "text".to_string(),
+                                        data: delta.to_string(),
+                                    }).await;
+                                }
                             }
                         }
                         last_reply_length = reply_len;

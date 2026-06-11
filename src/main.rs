@@ -122,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
             // Use browser chat directly (API is unreliable - returns 500/405)
             match auth_state {
                 Some(auth) => {
-                    let browser_result = browser::chat_via_browser(&message, &auth).await?;
+                    let browser_result = browser::chat_via_browser(&message, &auth, None).await?;
                     println!();
                     if !browser_result.thinking.is_empty() {
                         eprintln!("\n--- Thinking ---");
