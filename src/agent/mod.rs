@@ -151,15 +151,16 @@ impl AgentRuntime {
             let identity: AicqIdentity = serde_json::from_str(&content)?;
             tracing::info!("Loaded existing identity: {}", identity.agent_id);
 
-            let mut guard = self.identity.lock().await;
-            *guard = Some(identity);
+            {
+                let mut guard = self.identity.lock().await;
+                *guard = Some(identity);
+            } // Drop the guard BEFORE calling refresh_jwt to avoid deadlock
 
             // Refresh JWT - if this fails, delete the old identity and re-register
             match self.refresh_jwt().await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     tracing::warn!("JWT refresh failed ({}), re-registering...", e);
-                    drop(guard);
                     
                     // Delete the broken identity file
                     let _ = fs::remove_file(&identity_path);
