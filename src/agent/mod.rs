@@ -154,10 +154,19 @@ impl AgentRuntime {
             let mut guard = self.identity.lock().await;
             *guard = Some(identity);
 
-            // Refresh JWT
-            self.refresh_jwt().await?;
-
-            return Ok(());
+            // Refresh JWT - if this fails, delete the old identity and re-register
+            match self.refresh_jwt().await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!("JWT refresh failed ({}), re-registering...", e);
+                    drop(guard);
+                    
+                    // Delete the broken identity file
+                    let _ = fs::remove_file(&identity_path);
+                    
+                    // Fall through to generate new identity
+                }
+            }
         }
 
         // Generate new identity
