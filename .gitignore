@@ -1,6 +1,52 @@
+# Build artifacts
 /target
 **/*.rs.bk
-.env
-*.log
-.DS_Store
 Cargo.lock
+
+# Environment and secrets
+.env
+.env.*
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Unrelated projects
+openclaw-zero-token/
+zai/
+
+# Platform skills (not part of this project)
+skills/
+
+# Test/debug scripts
+*.py
+deploy_windows.py
+diagnose_agent.py
+quick_test.py
+test_*.py
+full_test_*.py
+
+# Node.js artifacts
+node_modules/
+package-lock.json
+
+# Download/upload directories
+download/
+upload/
+
+# JS files (not used by Rust project)
+auth.js
+client.js
+stealth.js
+
+# Work log (local only)
+worklog.md
