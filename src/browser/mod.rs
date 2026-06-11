@@ -1001,9 +1001,25 @@ async fn type_message_and_poll(
                         }
                     });
 
+                    // Also debug the thinking chain internal structure
+                    const tcDebug = [];
+                    document.querySelectorAll('[class*="thinking-chain"]').forEach(tc => {
+                        tcDebug.push({
+                            classes: tc.className,
+                            childCount: tc.children.length,
+                            innerTextLen: tc.innerText.length,
+                            innerTextPreview: tc.innerText.substring(0, 80),
+                            textContentLen: tc.textContent.length,
+                            textContentPreview: tc.textContent.substring(0, 80),
+                            innerHTML_len: tc.innerHTML.length,
+                            childTags: [...tc.children].map(c => c.tagName + '.' + (c.className||'').substring(0,30)).slice(0,5),
+                        });
+                    });
+
                     return JSON.stringify({
                         relevantClasses: classList.slice(0, 30),
                         elements: lastElements.slice(-5),
+                        thinkingChainDebug: tcDebug,
                         url: window.location.href,
                     });
                 })()
@@ -1027,18 +1043,44 @@ async fn type_message_and_poll(
                 // Also check for the "Thinking..." button state (during active thinking).
                 const thinkingContainers = document.querySelectorAll('[class*="thinking-chain"]');
                 thinkingContainers.forEach(el => {
-                    // Get the full text content of the thinking chain
-                    const text = el.innerText.trim();
-                    if (text && text !== 'Thought Process' && text !== 'Thinking...' && text !== '正在思考' && text !== '跳过' && text !== '正在思考\n跳过' && text !== '跳过\n正在思考') {
-                        thinkingText += text + '\n';
+                    // Try to click the thinking chain header to expand it (reveal hidden steps)
+                    try {
+                        const header = el.querySelector('button, [role="button"], [class*="header"], [class*="toggle"]');
+                        if (header) header.click();
+                    } catch(e) {}
+                    
+                    // Use textContent to capture hidden/collapsed thinking content
+                    // innerText skips hidden elements, but textContent captures all
+                    const allText = el.textContent.trim();
+                    const visibleText = el.innerText.trim();
+                    
+                    // Prefer textContent if it's longer (contains hidden thinking steps)
+                    let text = allText.length > visibleText.length ? allText : visibleText;
+                    
+                    // Filter out pure placeholder/header texts
+                    const placeholders = ['Thought Process', 'Thinking...', '正在思考', '跳过', 
+                        '正在思考\n跳过', '跳过\n正在思考', '思考过程', '思考'];
+                    if (text && !placeholders.includes(text)) {
+                        // Remove "思考过程" header prefix if present
+                        text = text.replace(/^思考过程[\s\n]*/, '');
+                        if (text.trim()) {
+                            thinkingText += text.trim() + '\n';
+                        }
                     }
                 });
 
                 // Also check for the older thinking-block class (for backward compat)
                 document.querySelectorAll('[class*="thinking-block"]').forEach(el => {
-                    const text = el.innerText.trim();
-                    if (text && text !== 'Thought Process' && text !== 'Thinking...' && text !== '正在思考' && text !== '跳过' && text !== '正在思考\n跳过' && text !== '跳过\n正在思考') {
-                        thinkingText += text + '\n';
+                    const allText = el.textContent.trim();
+                    const visibleText = el.innerText.trim();
+                    let text = allText.length > visibleText.length ? allText : visibleText;
+                    const placeholders = ['Thought Process', 'Thinking...', '正在思考', '跳过',
+                        '正在思考\n跳过', '跳过\n正在思考', '思考过程', '思考'];
+                    if (text && !placeholders.includes(text)) {
+                        text = text.replace(/^思考过程[\s\n]*/, '');
+                        if (text.trim()) {
+                            thinkingText += text.trim() + '\n';
+                        }
                     }
                 });
 
@@ -1197,6 +1239,7 @@ async fn type_message_and_poll(
                             || trimmed == "Thought Process"
                             || trimmed == "Thinking..."
                             || trimmed == "思考过程"
+                            || trimmed == "思考"
                     };
 
                     let has_real_content = !is_only_placeholder(thinking) || !is_only_placeholder(reply);
