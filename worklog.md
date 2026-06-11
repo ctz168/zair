@@ -242,3 +242,24 @@ Stage Summary:
   - Accept: POST /api/v1/friends/requests/{id}/accept → 200
   - Messages: WebSocket only (no REST API for messages)
   - WS format: {type:"online",nodeId:<JWT sub>,token:<JWT>}
+---
+Task ID: 1
+Agent: main
+Task: Skip API, use browser chat directly; capture and send thinking process to AICQ
+
+Work Log:
+- Analyzed user logs showing DOM structure: chat-assistant, thinking-block, markdown-prose, user-message classes
+- Modified browser/mod.rs: Changed JS extraction to return JSON {thinking, reply} separately
+- Fixed CSS selectors to match z.ai actual DOM: [class*="chat-assistant"], [class*="thinking-block"], [class*="markdown-prose"]
+- Added separate delta tracking for thinking_text and reply_text (last_thinking_length, last_reply_length, last_total_length)
+- Modified agent/mod.rs: Removed API call (zai_client.chat_stream), go directly to browser chat
+- Added thinking chunk streaming to AICQ via stream_chunk with chunkType="thinking"
+- Fixed UTF-8-safe string chunking (char-by-char instead of byte chunks)
+- Modified main.rs: Removed API call in Chat command, use browser chat directly
+- Build succeeds with only dead-code warnings (expected since API client is no longer used)
+
+Stage Summary:
+- Browser chat now extracts thinking and reply separately from DOM
+- Thinking process is sent to AICQ as stream_chunk messages with chunkType="thinking"
+- API attempts are completely skipped, saving ~1s per request
+- UTF-8-safe chunking prevents multi-byte character splitting

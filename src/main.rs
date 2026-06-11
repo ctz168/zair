@@ -110,8 +110,8 @@ async fn main() -> anyhow::Result<()> {
             runtime.run().await?;
         }
 
-        Commands::Chat { message, model } => {
-            let config = config::AppConfig::load()?;
+        Commands::Chat { message, model: _ } => {
+            let _config = config::AppConfig::load()?;
             let message = message.unwrap_or_else(|| {
                 eprintln!("Usage: zair chat <message>");
                 std::process::exit(1);
@@ -119,57 +119,23 @@ async fn main() -> anyhow::Result<()> {
 
             let auth_state = auth::load_auth();
 
-            // Try API strategies (web API → Open API), fallback to browser if all fail
-            let zai_client = client::ZaiClient::new(config.clone());
-            let api_result = zai_client
-                .chat_stream(
-                    &message,
-                    &model,
-                    None,
-                    None,
-                    Some(Box::new(|delta: &str, is_thinking: bool| {
-                        if is_thinking {
-                            eprint!("\x1b[90m{}\x1b[0m", delta);
-                        } else {
-                            eprint!("{}", delta);
-                        }
-                    })),
-                )
-                .await;
-
-            match api_result {
-                Ok(result) => {
+            // Use browser chat directly (API is unreliable - returns 500/405)
+            match auth_state {
+                Some(auth) => {
+                    let browser_result = browser::chat_via_browser(&message, &auth).await?;
                     println!();
-                    if !result.thinking.is_empty() {
+                    if !browser_result.thinking.is_empty() {
                         eprintln!("\n--- Thinking ---");
-                        eprintln!("{}", result.thinking);
+                        eprintln!("{}", browser_result.thinking);
                     }
+                    eprintln!("\n--- Reply ---");
+                    println!("{}", browser_result.reply);
+                    eprintln!("\n({} chars, {}ms)", browser_result.reply.len(), browser_result.elapsed_ms);
                 }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    // If all API strategies failed, try browser fallback
-                    if err_str.contains("All API strategies failed")
-                        || err_str.contains("405")
-                        || err_str.contains("403")
-                        || err_str.contains("401")
-                        || err_str.contains("blocked")
-                    {
-                        tracing::info!("API unavailable, falling back to browser chat...");
-                        if let Some(auth) = auth_state {
-                            let browser_result = browser::chat_via_browser(&message, &auth).await?;
-                            println!();
-                            if !browser_result.thinking.is_empty() {
-                                eprintln!("\n--- Thinking ---");
-                                eprintln!("{}", browser_result.thinking);
-                            }
-                        } else {
-                            return Err(anyhow::anyhow!(
-                                "API unavailable and no browser auth. Run `zair login` first, or set ZAI_API_KEY."
-                            ));
-                        }
-                    } else {
-                        return Err(e);
-                    }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "No browser auth available. Run `zair login` first."
+                    ));
                 }
             }
         }

@@ -871,7 +871,9 @@ pub async fn chat_via_browser(
     // Poll for the response, streaming as it comes in
     let mut reply_text = String::new();
     let mut thinking_text = String::new();
-    let mut last_length = 0;
+    let mut last_thinking_length: usize = 0;
+    let mut last_reply_length: usize = 0;
+    let mut last_total_length: usize = 0;
     let mut stable_count = 0;
 
     for poll_idx in 0..120 { // max 2 minutes
@@ -917,122 +919,137 @@ pub async fn chat_via_browser(
             tracing::info!("DOM debug (poll #{}): {:?}", poll_idx, debug_info);
         }
 
-        // Extract the latest assistant message from the DOM
-        // Z.AI uses a specific DOM structure for chat messages.
-        // We need to find the LAST AI/assistant message block and extract
-        // ONLY the non-thinking response text.
+        // Extract thinking and reply text separately from the DOM
+        // Z.AI DOM structure (confirmed from logs):
+        //   - thinking-block: contains the AI's reasoning/thinking text
+        //   - thinking-chain-container: header ("正在思考\n跳过")
+        //   - chat-assistant.markdown-prose: contains ALL text (thinking + reply)
+        //   - user-message: user's sent message
+        // We extract thinking from thinking-block, and reply from chat-assistant
+        // minus thinking sub-elements.
         let result = cdp.evaluate(r#"
             (() => {
-                // Strategy 1: Find the last message/assistant/response container
-                // and exclude any thinking/reasoning blocks within it
-                const selectors = [
-                    '[class*="message-assistant"]',
-                    '[class*="assistant-message"]',
-                    '[class*="response-"]',
-                    '[class*="message-content"]',
-                    '[class*="agent-message"]',
-                    '[class*="chat-message"]',
-                    '[class*="answer"]',
-                ];
+                // Extract thinking text from thinking-block elements only
+                let thinkingText = '';
+                document.querySelectorAll('[class*="thinking-block"]').forEach(el => {
+                    thinkingText += el.innerText.trim() + '\n';
+                });
 
-                for (const sel of selectors) {
-                    const els = document.querySelectorAll(sel);
-                    if (els.length > 0) {
-                        const last = els[els.length - 1];
-                        // Clone and remove thinking blocks
-                        const clone = last.cloneNode(true);
-                        clone.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="chain-of-thought"]').forEach(el => el.remove());
-                        const text = clone.innerText.trim();
-                        if (text) return text;
+                // Extract reply text: find the chat-assistant container and remove thinking blocks
+                let replyText = '';
+
+                // Strategy 1: Use chat-assistant class (z.ai's actual DOM structure)
+                const chatAssistant = document.querySelector('[class*="chat-assistant"]');
+                if (chatAssistant) {
+                    const clone = chatAssistant.cloneNode(true);
+                    clone.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="chain-of-thought"]').forEach(el => el.remove());
+                    replyText = clone.innerText.trim();
+                }
+
+                // Strategy 2: Try markdown-prose class
+                if (!replyText) {
+                    const prose = document.querySelector('[class*="markdown-prose"]');
+                    if (prose) {
+                        const clone = prose.cloneNode(true);
+                        clone.querySelectorAll('[class*="think"], [class*="reasoning"]').forEach(el => el.remove());
+                        replyText = clone.innerText.trim();
                     }
                 }
 
-                // Strategy 2: Find all message-like containers, get the last one
-                // that is NOT a thinking block
-                const allMsgs = document.querySelectorAll('[class*="message"]');
-                if (allMsgs.length > 0) {
+                // Strategy 3: Find message containers (excluding user messages and thinking)
+                if (!replyText) {
+                    const allMsgs = document.querySelectorAll('[class*="message"]');
                     for (let i = allMsgs.length - 1; i >= 0; i--) {
                         const el = allMsgs[i];
                         const classes = (el.className || '').toLowerCase();
-                        // Skip if this IS a thinking element
+                        if (classes.includes('user-message')) continue;
                         if (classes.includes('think') || classes.includes('reasoning')) continue;
-                        // Clone and remove thinking sub-elements
                         const clone = el.cloneNode(true);
                         clone.querySelectorAll('[class*="think"], [class*="reasoning"]').forEach(e => e.remove());
                         const text = clone.innerText.trim();
-                        if (text && text.length > 2) return text;
+                        if (text && text.length > 2) { replyText = text; break; }
                     }
                 }
 
-                // Strategy 3: Last resort - get text from the main chat area
-                // excluding elements with "think" in their class
-                const chatArea = document.querySelector('main, [class*="chat-content"], [class*="conversation"]');
-                if (chatArea) {
-                    const clone = chatArea.cloneNode(true);
-                    clone.querySelectorAll('[class*="think"], [class*="reasoning"]').forEach(e => e.remove());
-                    const text = clone.innerText.trim();
-                    // Only return the last portion
-                    const lines = text.split('\n').filter(l => l.trim());
-                    if (lines.length > 0) {
-                        return lines.slice(-10).join('\n');
-                    }
-                }
-
-                return '';
+                return JSON.stringify({ thinking: thinkingText.trim(), reply: replyText });
             })()
         "#).await;
 
         if let Ok(val) = result {
             if let Some(text) = val.as_str() {
-                let text = text.to_string();
-                let text_len = text.len();
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+                    let thinking = parsed["thinking"].as_str().unwrap_or("");
+                    let reply = parsed["reply"].as_str().unwrap_or("");
 
-                if text_len > 0 {
-                    if text_len > last_length {
-                        // New content detected - extract the delta
-                        // Find the nearest valid char boundary at or after last_length
-                        let safe_start = if last_length <= text_len {
-                            let mut pos = last_length;
-                            while pos < text_len && !text.is_char_boundary(pos) {
+                    let thinking_len = thinking.len();
+                    let reply_len = reply.len();
+                    let total_len = thinking_len + reply_len;
+
+                    // Track thinking deltas
+                    if thinking_len > last_thinking_length {
+                        // Find safe UTF-8 char boundary
+                        let safe_start = if last_thinking_length <= thinking_len {
+                            let mut pos = last_thinking_length;
+                            while pos < thinking_len && !thinking.is_char_boundary(pos) {
                                 pos += 1;
                             }
                             pos
                         } else {
-                            text_len
+                            thinking_len
                         };
 
-                        if safe_start < text_len {
-                            let delta = &text[safe_start..];
+                        if safe_start < thinking_len {
+                            let delta = &thinking[safe_start..];
                             if !delta.is_empty() {
-                                // Check for <think> tags (from API responses, not DOM-based thinking)
-                                // DOM-based thinking is already filtered by the JS extraction
-                                let is_thinking = text.contains("<think") && !text.contains("</think>");
-                                if is_thinking {
-                                    thinking_text.push_str(delta);
-                                } else {
-                                    eprint!("{}", delta);
-                                    reply_text.push_str(delta);
-                                }
+                                eprint!("\x1b[90m{}\x1b[0m", delta); // gray for thinking
+                                thinking_text.push_str(delta);
                             }
                         }
-                        last_length = text_len;
-                        stable_count = 0;
-                    } else if text_len < last_length {
-                        // Text got shorter - DOM was re-rendered (React update).
-                        // This can happen during streaming if React replaces the element.
-                        tracing::debug!("DOM text shrunk ({} -> {}), likely React re-render", last_length, text_len);
-                        // Don't output anything - we've already collected the previous text.
-                        // Just update the length tracker.
-                        last_length = text_len;
-                        stable_count = 0;
-                    } else {
-                        // Same length - content is stable
+                        last_thinking_length = thinking_len;
+                    } else if thinking_len < last_thinking_length {
+                        // Thinking text shrank (likely collapsed/hidden by React)
+                        tracing::debug!("Thinking text shrunk ({} -> {}), DOM update", last_thinking_length, thinking_len);
+                        last_thinking_length = thinking_len;
+                    }
+
+                    // Track reply deltas
+                    if reply_len > last_reply_length {
+                        // Find safe UTF-8 char boundary
+                        let safe_start = if last_reply_length <= reply_len {
+                            let mut pos = last_reply_length;
+                            while pos < reply_len && !reply.is_char_boundary(pos) {
+                                pos += 1;
+                            }
+                            pos
+                        } else {
+                            reply_len
+                        };
+
+                        if safe_start < reply_len {
+                            let delta = &reply[safe_start..];
+                            if !delta.is_empty() {
+                                eprint!("{}", delta);
+                                reply_text.push_str(delta);
+                            }
+                        }
+                        last_reply_length = reply_len;
+                    } else if reply_len < last_reply_length {
+                        // Reply text shrank (React re-render)
+                        tracing::debug!("Reply text shrunk ({} -> {}), likely React re-render", last_reply_length, reply_len);
+                        last_reply_length = reply_len;
+                    }
+
+                    // Check stability based on total content length
+                    if total_len > 0 && total_len == last_total_length {
                         stable_count += 1;
                         if stable_count >= 5 {
                             tracing::info!("Response complete (stable for 5s, poll #{})", poll_idx);
                             break;
                         }
+                    } else if total_len != last_total_length {
+                        stable_count = 0;
                     }
+                    last_total_length = total_len;
                 }
             }
         }
@@ -1045,7 +1062,7 @@ pub async fn chat_via_browser(
     Ok(BrowserChatResult {
         reply: reply_text,
         thinking: thinking_text,
-        raw_length: last_length,
+        raw_length: last_total_length,
         elapsed_ms: elapsed,
     })
 }

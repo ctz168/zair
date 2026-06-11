@@ -668,101 +668,78 @@ impl AgentRuntime {
         // Send "thinking" stream chunk to show we're processing
         self.send_stream_chunk(ws, from_id, "thinking", "💭").await;
 
-        // Generate reply via Z.AI
-        tracing::info!("🤖 Generating reply for: \"{}\"...", content.chars().take(60).collect::<String>());
+        // Use browser chat directly (API is unreliable - returns 500/405)
+        tracing::info!("🤖 Generating reply via browser chat for: \"{}\"...", content.chars().take(60).collect::<String>());
 
-        let reply_result = self
-            .zai_client
-            .chat_stream(
-                content,
-                &self.config.agent.model,
-                None,
-                Some(&self.config.agent.system_prompt),
-                Some(Box::new(|_delta: &str, _is_thinking: bool| {
-                    // We'll send the complete reply, not individual chunks
-                })),
-            )
-            .await;
-
-        match reply_result {
-            Ok(result) => {
-                // Send end of thinking
-                self.send_stream_chunk(ws, from_id, "reasoning_end", "").await;
-
-                // Send the actual text reply via stream chunks
-                // Split into chunks for better UX on the client
-                let text = &result.text;
-                if !text.is_empty() {
-                    // Send in chunks of ~100 chars
-                    for chunk in text.as_bytes().chunks(100) {
-                        let chunk_str = String::from_utf8_lossy(chunk).to_string();
-                        self.send_stream_chunk(ws, from_id, "text", &chunk_str).await;
-                    }
-                }
-
-                // Send stream end
-                self.send_stream_end(ws, from_id).await;
-
-                // Also send as a complete message for persistence
-                self.send_message(ws, from_id, text).await;
-
-                tracing::info!("✅ Reply sent ({} chars)", text.len());
-
-                // Save to memory
-                let mut memory = self.memory.lock().await;
-                if let Some(history) = memory.get_mut(from_id) {
-                    history.push(ConversationMessage {
-                        role: "assistant".to_string(),
-                        content: result.text,
-                    });
-                }
-            }
-            Err(e) => {
-                tracing::warn!("API failed for reply ({}), trying browser chat fallback...", e);
-
-                // Try browser chat as fallback
-                let auth_state = auth::load_auth();
-                match auth_state {
-                    Some(auth) => {
-                        match crate::browser::chat_via_browser(content, &auth).await {
-                            Ok(browser_result) => {
-                                // Send end of thinking
-                                self.send_stream_chunk(ws, from_id, "reasoning_end", "").await;
-
-                                let text = &browser_result.reply;
-                                if !text.is_empty() {
-                                    for chunk in text.as_bytes().chunks(100) {
-                                        let chunk_str = String::from_utf8_lossy(chunk).to_string();
-                                        self.send_stream_chunk(ws, from_id, "text", &chunk_str).await;
-                                    }
+        let auth_state = auth::load_auth();
+        match auth_state {
+            Some(auth) => {
+                match crate::browser::chat_via_browser(content, &auth).await {
+                    Ok(browser_result) => {
+                        // Send thinking text to AICQ if available
+                        if !browser_result.thinking.is_empty() {
+                            // Send in UTF-8-safe chunks (~100 bytes)
+                            let mut chunk = String::new();
+                            for ch in browser_result.thinking.chars() {
+                                if chunk.len() + ch.len_utf8() > 100 && !chunk.is_empty() {
+                                    self.send_stream_chunk(ws, from_id, "thinking", &chunk).await;
+                                    chunk.clear();
                                 }
-
-                                self.send_stream_end(ws, from_id).await;
-                                self.send_message(ws, from_id, text).await;
-                                tracing::info!("✅ Reply sent via browser fallback ({} chars)", text.len());
-
-                                // Save to memory
-                                let mut memory = self.memory.lock().await;
-                                if let Some(history) = memory.get_mut(from_id) {
-                                    history.push(ConversationMessage {
-                                        role: "assistant".to_string(),
-                                        content: browser_result.reply,
-                                    });
-                                }
+                                chunk.push(ch);
                             }
-                            Err(be) => {
-                                tracing::error!("❌ Browser fallback also failed: {}", be);
-                                self.send_stream_chunk(ws, from_id, "text", "抱歉，生成回复时出错了。请稍后再试。").await;
-                                self.send_stream_end(ws, from_id).await;
+                            if !chunk.is_empty() {
+                                self.send_stream_chunk(ws, from_id, "thinking", &chunk).await;
                             }
                         }
+
+                        // Send end of thinking
+                        self.send_stream_chunk(ws, from_id, "reasoning_end", "").await;
+
+                        // Send the actual text reply via stream chunks
+                        let text = &browser_result.reply;
+                        if !text.is_empty() {
+                            let mut chunk = String::new();
+                            for ch in text.chars() {
+                                if chunk.len() + ch.len_utf8() > 100 && !chunk.is_empty() {
+                                    self.send_stream_chunk(ws, from_id, "text", &chunk).await;
+                                    chunk.clear();
+                                }
+                                chunk.push(ch);
+                            }
+                            if !chunk.is_empty() {
+                                self.send_stream_chunk(ws, from_id, "text", &chunk).await;
+                            }
+                        }
+
+                        // Send stream end
+                        self.send_stream_end(ws, from_id).await;
+
+                        // Also send as a complete message for persistence
+                        self.send_message(ws, from_id, text).await;
+
+                        tracing::info!("✅ Reply sent via browser (thinking: {} chars, reply: {} chars)", 
+                            browser_result.thinking.len(), text.len());
+
+                        // Save to memory
+                        let mut memory = self.memory.lock().await;
+                        if let Some(history) = memory.get_mut(from_id) {
+                            history.push(ConversationMessage {
+                                role: "assistant".to_string(),
+                                content: browser_result.reply,
+                            });
+                        }
                     }
-                    None => {
-                        tracing::error!("❌ No auth state for browser fallback");
-                        self.send_stream_chunk(ws, from_id, "text", "抱歉，生成回复时出错了。请先运行 zair login。").await;
+                    Err(be) => {
+                        tracing::error!("❌ Browser chat failed: {}", be);
+                        self.send_stream_chunk(ws, from_id, "text", "抱歉，生成回复时出错了。请稍后再试。").await;
                         self.send_stream_end(ws, from_id).await;
                     }
                 }
+            }
+            None => {
+                tracing::error!("❌ No auth state - run zair login first");
+                self.send_stream_chunk(ws, from_id, "text", "抱歉，生成回复时出错了。请先运行 zair login。").await;
+                self.send_stream_end(ws, from_id).await;
             }
         }
 
