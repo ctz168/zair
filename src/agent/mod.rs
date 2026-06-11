@@ -56,9 +56,17 @@ fn decode_jwt_payload(token: &str) -> Result<serde_json::Value> {
         bail!("Invalid JWT format: expected 3 parts, got {}", parts.len());
     }
     let payload_b64 = parts[1];
-    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let payload_bytes = engine
+    // Try URL_SAFE_NO_PAD first (most JWTs), then URL_SAFE with padding
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload_b64)
+        .or_else(|_| {
+            // Add padding if needed
+            let padded = {
+                let pad_len = (4 - payload_b64.len() % 4) % 4;
+                format!("{}{}", payload_b64, "=".repeat(pad_len))
+            };
+            base64::engine::general_purpose::URL_SAFE.decode(&padded)
+        })
         .context("Failed to decode JWT payload base64")?;
     let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
         .context("Failed to parse JWT payload JSON")?;
@@ -374,9 +382,12 @@ impl AgentRuntime {
 
         tracing::info!("Connecting to {}...", ws_url);
 
-        let (mut ws_stream, _) = connect_async(&ws_url)
+        let (ws_stream, _) = connect_async(&ws_url)
             .await
             .context("Failed to connect to AICQ WebSocket")?;
+
+        // Split into sink (for sending) and stream (for receiving)
+        let (mut ws_sink, mut ws_rx) = ws_stream.split();
 
         // Get JWT and determine nodeId
         let jwt = self.jwt_token.lock().await;
@@ -412,24 +423,24 @@ impl AgentRuntime {
         });
 
         tracing::info!("Sending WS auth: nodeId={}", node_id);
-        ws_stream
+        ws_sink
             .send(tungstenite::Message::Text(online_msg.to_string()))
             .await?;
 
         tracing::info!("WebSocket connected, authenticating...");
 
         // Main message loop
-        while let Some(msg) = ws_stream.next().await {
+        while let Some(msg) = ws_rx.next().await {
             match msg {
                 Ok(tungstenite::Message::Text(text)) => {
                     if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Err(e) = self.handle_ws_message(data, &mut ws_stream).await {
+                        if let Err(e) = self.handle_ws_message(data, &mut ws_sink).await {
                             tracing::error!("Error handling WS message: {}", e);
                         }
                     }
                 }
                 Ok(tungstenite::Message::Ping(data)) => {
-                    let _ = ws_stream.send(tungstenite::Message::Pong(data)).await;
+                    let _ = ws_sink.send(tungstenite::Message::Pong(data)).await;
                 }
                 Ok(tungstenite::Message::Close(_)) => {
                     tracing::warn!("WebSocket connection closed");
@@ -475,6 +486,26 @@ impl AgentRuntime {
                     "📢 System: {}",
                     data["message"].as_str().unwrap_or("")
                 );
+            }
+            "friends_online" => {
+                // Server tells us which friends are currently online
+                let node_ids: Vec<&str> = data["nodeIds"]
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                tracing::info!("👥 Friends online: {:?}", node_ids);
+            }
+            "presence" => {
+                // Friend came online or went offline
+                let node_id = data["nodeId"].as_str().unwrap_or("");
+                let online = data["online"].as_bool().unwrap_or(false);
+                tracing::info!("👤 {} is {}", node_id, if online { "online" } else { "offline" });
+            }
+            "message_ack" => {
+                // Our message was acknowledged by the server
+                tracing::debug!("✉️ Message ack: to={} status={}", 
+                    data["to"].as_str().unwrap_or("?"),
+                    data["status"].as_str().unwrap_or("?"));
             }
             "message" | "private_message" => {
                 // AICQ message format: {type: "message", from: senderId, data: {id, from_id, to_id, type, content, ...}}

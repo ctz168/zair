@@ -618,7 +618,7 @@ impl ZaiClient {
         tag_buffer: &mut String,
         accumulated_content: &mut String,
         thinking_content: &mut String,
-        callback: &Option<StreamCallback>,
+        callback: &Option<&StreamCallback>,
     ) {
         tag_buffer.push_str(delta);
 
