@@ -1179,6 +1179,20 @@ fn which_chrome() -> Result<std::path::PathBuf> {
         }
     }
 
+    // Try to find agent-browser bundled Chrome dynamically
+    if let Ok(entries) = std::fs::read_dir("/home/z/.agent-browser/browsers/") {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if dir.file_name().map(|n| n.to_string_lossy().starts_with("chrome-")).unwrap_or(false) {
+                let chrome_bin = dir.join("chrome");
+                if chrome_bin.exists() {
+                    tracing::info!("Found agent-browser Chrome: {}", chrome_bin.display());
+                    return Ok(chrome_bin);
+                }
+            }
+        }
+    }
+
     // Try PATH lookup
     for cmd in &["chrome", "chromium-browser", "chromium", "google-chrome"] {
         #[cfg(windows)]
