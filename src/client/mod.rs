@@ -281,7 +281,7 @@ impl ZaiClient {
             if !retry_res.status().is_success() {
                 let status = retry_res.status();
                 let text = retry_res.text().await.unwrap_or_default();
-                let truncated = &text[..text.len().min(200)];
+                let truncated: String = text.chars().take(200).collect();
                 bail!("API error after retry ({}): {}", status, truncated);
             }
 
@@ -300,7 +300,7 @@ impl ZaiClient {
 
         if !res.status().is_success() {
             let text = res.text().await.unwrap_or_default();
-            let truncated = &text[..text.len().min(200)];
+            let truncated: String = text.chars().take(200).collect();
             bail!("API error ({}): {}", status, truncated);
         }
 
@@ -356,7 +356,7 @@ impl ZaiClient {
         if !res.status().is_success() {
             let status = res.status();
             let text = res.text().await.unwrap_or_default();
-            let truncated = &text[..text.len().min(200)];
+            let truncated: String = text.chars().take(200).collect();
             bail!("Legacy API error ({}): {}", status, truncated);
         }
 
@@ -404,7 +404,7 @@ impl ZaiClient {
         if !res.status().is_success() {
             let status = res.status();
             let text = res.text().await.unwrap_or_default();
-            let truncated = &text[..text.len().min(200)];
+            let truncated: String = text.chars().take(200).collect();
             bail!("Open API error ({}): {}", status, truncated);
         }
 

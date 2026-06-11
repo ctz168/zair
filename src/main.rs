@@ -151,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
                     if err_str.contains("All API strategies failed")
                         || err_str.contains("405")
                         || err_str.contains("403")
+                        || err_str.contains("401")
                         || err_str.contains("blocked")
                     {
                         tracing::info!("API unavailable, falling back to browser chat...");

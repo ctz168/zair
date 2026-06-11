@@ -142,7 +142,25 @@ impl ChromeProcess {
 
         tracing::info!("Launching headless Chrome on port {}", port);
 
+        // Use the SAME data directory as login so we inherit the auth state.
+        // Kill any existing Chrome processes first to avoid profile lock conflicts.
         let data_dir = chrome_data_dir();
+
+        // Try to kill existing Chrome instances that might hold the profile lock
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/f", "/im", "chrome.exe"])
+                .output();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = std::process::Command::new("pkill")
+                .arg("-9")
+                .arg("chrome")
+                .output();
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
 
         let mut cmd = Command::new(&chrome_path);
         cmd.args([
@@ -596,8 +614,22 @@ pub async fn chat_via_browser(
             (url, true, None)
         }
         None => {
-            // Launch a new headless Chrome with the same profile
-            let chrome = ChromeProcess::launch_headless()?;
+            // Launch a new headless Chrome with a separate profile
+            let chrome = match ChromeProcess::launch_headless() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("Failed to launch headless Chrome ({}), killing existing Chrome and retrying...", e);
+                    // Kill any lingering Chrome processes that might hold the profile lock
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/f", "/im", "chrome.exe"])
+                        .output();
+                    let _ = std::process::Command::new("killall")
+                        .arg("chrome")
+                        .output();
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    ChromeProcess::launch_headless()?
+                }
+            };
             tokio::time::sleep(Duration::from_secs(3)).await;
             let url = get_page_ws_url_for_port(ZAI_CDP_PORT_HEADLESS).await?;
             (url, false, Some(chrome))
@@ -619,21 +651,87 @@ pub async fn chat_via_browser(
     if current_url.contains("chat.z.ai") && is_existing {
         tracing::info!("Already on chat.z.ai, reusing session");
     } else {
-        // Inject stealth and cookies, then navigate
+        // Inject stealth first
         inject_stealth_via_cdp(&mut cdp).await?;
 
+        // Navigate to z.ai first (cookies need a domain context)
+        tracing::info!("Navigating to chat.z.ai (first pass for cookies)...");
+        cdp.navigate("https://chat.z.ai").await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Now inject cookies while on the correct domain
+        let mut cookie_count = 0;
         for cookie_part in auth_state.cookie.split(';') {
             let trimmed = cookie_part.trim();
             if let Some(eq_idx) = trimmed.find('=') {
                 let name = &trimmed[..eq_idx];
                 let value = &trimmed[eq_idx + 1..];
-                cdp.set_cookie(name, value, ".z.ai", "/").await?;
+                // Set cookie - try multiple domain formats for maximum compatibility
+                for domain in &[".z.ai", "chat.z.ai", "z.ai"] {
+                    match cdp.set_cookie(name, value, domain, "/").await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!("Failed to set cookie {} for {}: {}", name, domain, e);
+                        }
+                    }
+                }
+                cookie_count += 1;
             }
         }
+        tracing::info!("Injected {} cookies via CDP", cookie_count);
 
-        tracing::info!("Navigating to chat.z.ai...");
+        // Verify cookies were actually set
+        let verify_cookies = cdp.evaluate(r#"
+            (() => {
+                return document.cookie.substring(0, 500);
+            })()
+        "#).await;
+        tracing::info!("Cookies after injection: {:?}", verify_cookies);
+
+        // Also set cookies via JavaScript as a fallback (for non-httpOnly cookies)
+        let js_cookie_result = cdp.evaluate(&format!(r#"
+            (() => {{
+                const cookieStr = {:?};
+                const pairs = cookieStr.split('; ');
+                let count = 0;
+                for (const pair of pairs) {{
+                    try {{
+                        document.cookie = pair + '; path=/; domain=.z.ai';
+                        count++;
+                    }} catch(e) {{}}
+                }}
+                return count;
+            }})()
+        "#, auth_state.cookie)).await;
+        tracing::info!("JS cookie injection result: {:?}", js_cookie_result);
+
+        // Reload with cookies now set
+        tracing::info!("Reloading chat.z.ai with cookies...");
         cdp.navigate(ZAI_CHAT_URL).await?;
         tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Force a hard reload to ensure the page picks up the new cookies
+        // (SPA may have cached the unauthenticated state)
+        cdp.evaluate("location.reload(true)").await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Verify we're logged in by checking for auth cookies and chat UI
+        let login_check = cdp.evaluate(r#"
+            (() => {
+                const ta = document.querySelector('textarea');
+                const placeholder = ta ? ta.placeholder : '';
+                const cookieStr = document.cookie;
+                const hasAuth = cookieStr.includes('token=') || cookieStr.includes('chatglm');
+                return JSON.stringify({
+                    hasTextarea: ta !== null,
+                    placeholder: placeholder,
+                    hasAuthCookie: hasAuth,
+                    cookiePreview: cookieStr.substring(0, 200),
+                    url: window.location.href,
+                });
+            })()
+        "#).await;
+        tracing::info!("Login check after cookie injection: {:?}", login_check);
     }
 
     // Find and type into the textarea using JS (React-compatible)
@@ -656,7 +754,7 @@ pub async fn chat_via_browser(
     "#).await?;
     tracing::info!("Page state: {:?}", textarea_check);
 
-    // Use CDP Input.dispatchKeyEvent for more reliable keyboard input
+    // Use Input.insertText for reliable text input, then trigger React events
     // First click on the textarea
     cdp.evaluate(r#"
         (() => {
@@ -669,14 +767,48 @@ pub async fn chat_via_browser(
     // Small delay for focus
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Use Input.insertText for reliable text input (bypasses React's synthetic events)
+    // Use Input.insertText to type the message
     cdp.send_command(
         "Input.insertText",
         serde_json::json!({ "text": message }),
     ).await?;
 
-    // Small delay then press Enter via Input.dispatchKeyEvent
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Small delay for React to process
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Check if the textarea has content
+    let textarea_content = cdp.evaluate(r#"
+        (() => {
+            const ta = document.querySelector('textarea');
+            return ta ? ta.value : '';
+        })()
+    "#).await;
+    tracing::info!("Textarea content after insert: {:?}", textarea_content);
+
+    // If textarea is empty, try JavaScript-based input as fallback
+    if let Ok(val) = &textarea_content {
+        let content = val.as_str().unwrap_or("");
+        if content.is_empty() {
+            tracing::warn!("Input.insertText didn't work, trying JS-based input...");
+            // Use React-compatible JS input method
+            let escaped_msg = message.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+            cdp.evaluate(&format!(r#"
+                (() => {{
+                    const ta = document.querySelector('textarea');
+                    if (!ta) return 'no_textarea';
+                    
+                    // Use nativeInputValueSetter to bypass React's controlled input
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLTextAreaElement.prototype, 'value'
+                    ).set;
+                    nativeInputValueSetter.call(ta, "{escaped_msg}");
+                    ta.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    ta.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return ta.value.substring(0, 50);
+                }})()
+            "#)).await?;
+        }
+    }
 
     // Press Enter key down
     cdp.send_command(
@@ -702,6 +834,35 @@ pub async fn chat_via_browser(
         }),
     ).await?;
 
+    // Wait a moment and check if the message was sent (URL should change to /c/xxx)
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let url_after_enter = cdp.evaluate("window.location.href").await
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    if !url_after_enter.contains("/c/") {
+        tracing::warn!("Enter key didn't submit the message (URL still: {}), trying send button...", url_after_enter);
+        // Try clicking the send button
+        cdp.evaluate(r#"
+            (() => {
+                // Look for a send/submit button near the textarea
+                const btn = document.querySelector('button[type="submit"]') ||
+                    document.querySelector('[class*="send"]') ||
+                    document.querySelector('[aria-label*="send"]') ||
+                    document.querySelector('[aria-label*="Send"]') ||
+                    document.querySelector('form button') ||
+                    // Try finding any button that's a sibling of the textarea
+                    document.querySelector('textarea').closest('form')?.querySelector('button');
+                if (btn) { btn.click(); return 'clicked'; }
+                // Also try submitting the form directly
+                const form = document.querySelector('textarea')?.closest('form');
+                if (form) { form.submit(); return 'form_submitted'; }
+                return 'no_button_found';
+            })()
+        "#).await?;
+    }
+
     tracing::info!("Message sent, waiting for response...");
 
     // Wait for the response to start appearing
@@ -717,19 +878,38 @@ pub async fn chat_via_browser(
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         // On first few polls, also log the page structure for debugging
-        if poll_idx < 3 {
+        if poll_idx < 5 {
             let debug_info = cdp.evaluate(r#"
                 (() => {
-                    const md = document.querySelectorAll('.markdown-body');
-                    const msg = document.querySelectorAll('[class*="message"]');
-                    const prose = document.querySelectorAll('.prose');
-                    const think = document.querySelectorAll('[class*="think"]');
+                    // Inspect the actual DOM structure of z.ai's chat page
+                    // Find all direct children of the main chat area
+                    const allClasses = new Set();
+                    document.querySelectorAll('*').forEach(el => {
+                        el.classList.forEach(c => allClasses.add(c));
+                    });
+                    const classList = [...allClasses].filter(c =>
+                        c.includes('message') || c.includes('chat') || c.includes('think') ||
+                        c.includes('response') || c.includes('answer') || c.includes('assistant') ||
+                        c.includes('markdown') || c.includes('prose') || c.includes('bubble') ||
+                        c.includes('content') || c.includes('reply') || c.includes('agent')
+                    ).sort();
+
+                    // Find the last few elements that might contain the response
+                    const lastElements = [];
+                    document.querySelectorAll('[class*="message"], [class*="response"], [class*="answer"], [class*="think"], [class*="assistant"]').forEach(el => {
+                        if (el.innerText && el.innerText.trim().length > 0 && el.children.length < 3) {
+                            lastElements.push({
+                                tag: el.tagName,
+                                classes: el.className,
+                                textLen: el.innerText.length,
+                                textPreview: el.innerText.substring(0, 50),
+                            });
+                        }
+                    });
+
                     return JSON.stringify({
-                        markdownBodyCount: md.length,
-                        lastMdLen: md.length > 0 ? md[md.length-1].innerText.length : 0,
-                        messageCount: msg.length,
-                        proseCount: prose.length,
-                        thinkCount: think.length,
+                        relevantClasses: classList.slice(0, 30),
+                        elements: lastElements.slice(-5),
                         url: window.location.href,
                     });
                 })()
@@ -738,39 +918,64 @@ pub async fn chat_via_browser(
         }
 
         // Extract the latest assistant message from the DOM
-        // We use a focused strategy: find the LAST assistant/AI message block
-        // Z.AI's chat interface renders messages as separate DOM nodes.
-        // We look for the last AI response by searching for markdown-body elements
-        // which contain the rendered AI reply.
+        // Z.AI uses a specific DOM structure for chat messages.
+        // We need to find the LAST AI/assistant message block and extract
+        // ONLY the non-thinking response text.
         let result = cdp.evaluate(r#"
             (() => {
-                // Strategy 1: Find the last .markdown-body element (Z.AI renders AI responses as markdown)
-                const markdownEls = document.querySelectorAll('.markdown-body');
-                if (markdownEls.length > 0) {
-                    // Get the last one - this is the current AI response
-                    const lastEl = markdownEls[markdownEls.length - 1];
-                    return lastEl.innerText;
-                }
-
-                // Strategy 2: Look for common AI response container patterns
-                const aiSelectors = [
-                    '.message-assistant:last-child .message-text',
-                    '.assistant-message:last-child',
-                    '[data-role="assistant"]:last-child',
-                    '.chat-message:last-child .markdown',
-                    '.prose:last-child',  // Tailwind prose class used for AI responses
+                // Strategy 1: Find the last message/assistant/response container
+                // and exclude any thinking/reasoning blocks within it
+                const selectors = [
+                    '[class*="message-assistant"]',
+                    '[class*="assistant-message"]',
+                    '[class*="response-"]',
+                    '[class*="message-content"]',
+                    '[class*="agent-message"]',
+                    '[class*="chat-message"]',
+                    '[class*="answer"]',
                 ];
-                for (const sel of aiSelectors) {
-                    const el = document.querySelector(sel);
-                    if (el && el.innerText.trim()) return el.innerText;
+
+                for (const sel of selectors) {
+                    const els = document.querySelectorAll(sel);
+                    if (els.length > 0) {
+                        const last = els[els.length - 1];
+                        // Clone and remove thinking blocks
+                        const clone = last.cloneNode(true);
+                        clone.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="chain-of-thought"]').forEach(el => el.remove());
+                        const text = clone.innerText.trim();
+                        if (text) return text;
+                    }
                 }
 
-                // Strategy 3: Find all message-like blocks and get the last one
-                // This is a fallback that looks for any element with "message" or "chat" in its class
-                const allBlocks = document.querySelectorAll('[class*="message-text"], [class*="markdown"], [class*="prose"]');
-                if (allBlocks.length > 0) {
-                    const last = allBlocks[allBlocks.length - 1];
-                    if (last.innerText.trim()) return last.innerText;
+                // Strategy 2: Find all message-like containers, get the last one
+                // that is NOT a thinking block
+                const allMsgs = document.querySelectorAll('[class*="message"]');
+                if (allMsgs.length > 0) {
+                    for (let i = allMsgs.length - 1; i >= 0; i--) {
+                        const el = allMsgs[i];
+                        const classes = (el.className || '').toLowerCase();
+                        // Skip if this IS a thinking element
+                        if (classes.includes('think') || classes.includes('reasoning')) continue;
+                        // Clone and remove thinking sub-elements
+                        const clone = el.cloneNode(true);
+                        clone.querySelectorAll('[class*="think"], [class*="reasoning"]').forEach(e => e.remove());
+                        const text = clone.innerText.trim();
+                        if (text && text.length > 2) return text;
+                    }
+                }
+
+                // Strategy 3: Last resort - get text from the main chat area
+                // excluding elements with "think" in their class
+                const chatArea = document.querySelector('main, [class*="chat-content"], [class*="conversation"]');
+                if (chatArea) {
+                    const clone = chatArea.cloneNode(true);
+                    clone.querySelectorAll('[class*="think"], [class*="reasoning"]').forEach(e => e.remove());
+                    const text = clone.innerText.trim();
+                    // Only return the last portion
+                    const lines = text.split('\n').filter(l => l.trim());
+                    if (lines.length > 0) {
+                        return lines.slice(-10).join('\n');
+                    }
                 }
 
                 return '';
@@ -799,6 +1004,8 @@ pub async fn chat_via_browser(
                         if safe_start < text_len {
                             let delta = &text[safe_start..];
                             if !delta.is_empty() {
+                                // Check for <think> tags (from API responses, not DOM-based thinking)
+                                // DOM-based thinking is already filtered by the JS extraction
                                 let is_thinking = text.contains("<think") && !text.contains("</think>");
                                 if is_thinking {
                                     thinking_text.push_str(delta);
@@ -813,18 +1020,9 @@ pub async fn chat_via_browser(
                     } else if text_len < last_length {
                         // Text got shorter - DOM was re-rendered (React update).
                         // This can happen during streaming if React replaces the element.
-                        // Reset and output the full current text since we can't reliably diff.
                         tracing::debug!("DOM text shrunk ({} -> {}), likely React re-render", last_length, text_len);
-                        // Only reset if we haven't already collected significant text
-                        if reply_text.is_empty() && thinking_text.is_empty() {
-                            let is_thinking = text.contains("<think") && !text.contains("</think>");
-                            if is_thinking {
-                                thinking_text = text.clone();
-                            } else {
-                                eprint!("{}", &text);
-                                reply_text = text.clone();
-                            }
-                        }
+                        // Don't output anything - we've already collected the previous text.
+                        // Just update the length tracker.
                         last_length = text_len;
                         stable_count = 0;
                     } else {

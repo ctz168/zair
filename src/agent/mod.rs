@@ -632,8 +632,9 @@ impl AgentRuntime {
         }
         drop(account_id);
 
-        // Dedup
-        let dedup_key = format!("{}:{}", from_id, &content[..content.len().min(100)]);
+        // Dedup - safe UTF-8 truncation
+        let content_preview: String = content.chars().take(100).collect();
+        let dedup_key = format!("{}:{}", from_id, content_preview);
         {
             let mut processed = self.processed_messages.lock().await;
             if processed.contains(&dedup_key) {
@@ -648,7 +649,7 @@ impl AgentRuntime {
             }
         }
 
-        tracing::info!("📩 Message from {}: {}", from_id, &content[..content.len().min(80)]);
+        tracing::info!("📩 Message from {}: {}", from_id, &content.chars().take(80).collect::<String>());
 
         // Add to memory
         {
@@ -668,7 +669,7 @@ impl AgentRuntime {
         self.send_stream_chunk(ws, from_id, "thinking", "💭").await;
 
         // Generate reply via Z.AI
-        tracing::info!("🤖 Generating reply for: \"{}\"...", &content[..content.len().min(60)]);
+        tracing::info!("🤖 Generating reply for: \"{}\"...", content.chars().take(60).collect::<String>());
 
         let reply_result = self
             .zai_client
@@ -717,9 +718,51 @@ impl AgentRuntime {
                 }
             }
             Err(e) => {
-                tracing::error!("❌ Error generating reply: {}", e);
-                self.send_stream_chunk(ws, from_id, "text", "抱歉，生成回复时出错了。请稍后再试。").await;
-                self.send_stream_end(ws, from_id).await;
+                tracing::warn!("API failed for reply ({}), trying browser chat fallback...", e);
+
+                // Try browser chat as fallback
+                let auth_state = auth::load_auth();
+                match auth_state {
+                    Some(auth) => {
+                        match crate::browser::chat_via_browser(content, &auth).await {
+                            Ok(browser_result) => {
+                                // Send end of thinking
+                                self.send_stream_chunk(ws, from_id, "reasoning_end", "").await;
+
+                                let text = &browser_result.reply;
+                                if !text.is_empty() {
+                                    for chunk in text.as_bytes().chunks(100) {
+                                        let chunk_str = String::from_utf8_lossy(chunk).to_string();
+                                        self.send_stream_chunk(ws, from_id, "text", &chunk_str).await;
+                                    }
+                                }
+
+                                self.send_stream_end(ws, from_id).await;
+                                self.send_message(ws, from_id, text).await;
+                                tracing::info!("✅ Reply sent via browser fallback ({} chars)", text.len());
+
+                                // Save to memory
+                                let mut memory = self.memory.lock().await;
+                                if let Some(history) = memory.get_mut(from_id) {
+                                    history.push(ConversationMessage {
+                                        role: "assistant".to_string(),
+                                        content: browser_result.reply,
+                                    });
+                                }
+                            }
+                            Err(be) => {
+                                tracing::error!("❌ Browser fallback also failed: {}", be);
+                                self.send_stream_chunk(ws, from_id, "text", "抱歉，生成回复时出错了。请稍后再试。").await;
+                                self.send_stream_end(ws, from_id).await;
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::error!("❌ No auth state for browser fallback");
+                        self.send_stream_chunk(ws, from_id, "text", "抱歉，生成回复时出错了。请先运行 zair login。").await;
+                        self.send_stream_end(ws, from_id).await;
+                    }
+                }
             }
         }
 
