@@ -790,16 +790,9 @@ impl AgentRuntime {
                     // Wait for forwarder to finish sending all queued chunks
                     let _ = stream_forwarder.await;
 
-                    // Send stream_end signal so AICQ clients know the stream is done
-                    {
-                        let end_msg = serde_json::json!({
-                            "type": "stream_end",
-                            "to": from_id_owned,
-                        });
-                        let _ = outgoing_tx
-                            .send(tungstenite::Message::Text(end_msg.to_string()))
-                            .await;
-                    }
+                    // NOTE: stream_end is sent AFTER the fallback (if any).
+                    // Sending it here would tell the client the stream is over
+                    // while we're still about to send fallback chunks.
 
                     // ── Agent mode fallback: if Agent failed and we have a
                     // non-Agent model available, retry once with normal chat.
@@ -813,10 +806,31 @@ impl AgentRuntime {
                                 "Agent mode failed ({}); falling back to normal chat",
                                 e
                             );
-                            // Reset any browser session so the fallback gets a fresh one
+                            // Switch the existing browser session back to a non-Agent
+                            // model (glm-4.7) so the fallback doesn't hit the same
+                            // Agent-mode server error. This clears the localStorage
+                            // selectedModels and reloads the page.
                             {
                                 let mut session_guard = browser_session.lock().await;
-                                *session_guard = None;
+                                if let Some(session) = session_guard.as_mut() {
+                                    if let Err(switch_err) = session.switch_to_chat_mode().await {
+                                        tracing::warn!(
+                                            "switch_to_chat_mode failed: {} — will reset session",
+                                            switch_err
+                                        );
+                                        *session_guard = None;
+                                    }
+                                } else {
+                                    // No existing session — create one and switch
+                                    let mut s = BrowserSession::new(&auth);
+                                    if let Err(switch_err) = s.switch_to_chat_mode().await {
+                                        tracing::warn!(
+                                            "switch_to_chat_mode failed: {} — will proceed anyway",
+                                            switch_err
+                                        );
+                                    }
+                                    *session_guard = Some(s);
+                                }
                             }
                             let (fb_tx, mut fb_rx) =
                                 tokio::sync::mpsc::channel::<StreamChunk>(128);
@@ -857,14 +871,6 @@ impl AgentRuntime {
                             };
                             drop(fb_tx);
                             let _ = fb_forwarder.await;
-                            // Send another stream_end after fallback
-                            let end_msg = serde_json::json!({
-                                "type": "stream_end",
-                                "to": from_id_owned,
-                            });
-                            let _ = outgoing_tx
-                                .send(tungstenite::Message::Text(end_msg.to_string()))
-                                .await;
                             match fb_result {
                                 Ok(Ok(r)) => Ok(r),
                                 Ok(Err(e2)) => Err(e2),
@@ -873,6 +879,20 @@ impl AgentRuntime {
                         }
                         Err(e) => Err(e),
                     };
+
+                    // Send stream_end signal so AICQ clients know the stream is done.
+                    // This runs AFTER the fallback (if any) so the client doesn't
+                    // close the stream prematurely while fallback chunks are still
+                    // being sent.
+                    {
+                        let end_msg = serde_json::json!({
+                            "type": "stream_end",
+                            "to": from_id_owned,
+                        });
+                        let _ = outgoing_tx
+                            .send(tungstenite::Message::Text(end_msg.to_string()))
+                            .await;
+                    }
 
                     // ── Process final result ──
                     match result {
