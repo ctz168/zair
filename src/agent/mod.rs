@@ -27,8 +27,8 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite};
 
 use crate::auth;
-use crate::browser::{BrowserSession, StreamChunk};
-use crate::client::ZaiClient;
+use crate::browser::{self, BrowserSession, StreamChunk};
+use crate::client::{StreamCallback, ZaiClient};
 use crate::config::AppConfig;
 
 // ─── Types ────────────────────────────────────────────────────
@@ -681,53 +681,212 @@ impl AgentRuntime {
             };
             tracing::info!("Semaphore acquired, starting browser chat for: \"{}\"...", content_owned.chars().take(60).collect::<String>());
 
-            // ── Browser chat using persistent session ──
+            // ── Browser chat with streaming ──
+            // Two paths:
+            //   1. Agent mode (GLM-5.x): uses browser fetch hijack to get real
+            //      SSE stream (reasoning_content + content deltas).
+            //   2. Normal chat: uses BrowserSession::chat() with DOM polling,
+            //      also streams thinking + reply via the same mpsc channel.
+            //
+            // Both paths feed StreamChunk through `stream_tx`, which a
+            // forwarder task converts into AICQ `stream_chunk` WS messages
+            // (chunkType="thinking" or "text"). After the chat completes,
+            // we send `stream_end` and then a final `type:"message"` with
+            // the full reply (so clients that don't support streaming still
+            // see the complete answer).
             match auth_state {
                 Some(auth) => {
-                    // Get or create the browser session
-                    let browser_result = {
-                        let mut session_guard = browser_session.lock().await;
-                        
-                        // Create session if it doesn't exist
-                        if session_guard.is_none() {
-                            tracing::info!("Creating new BrowserSession...");
-                            *session_guard = Some(BrowserSession::new(&auth));
+                    let agent_mode = ZaiClient::is_agent_model(&config.agent.model);
+                    tracing::info!(
+                        "Chat path: {} (model={})",
+                        if agent_mode { "AGENT (fetch hijack + SSE)" } else { "NORMAL (DOM polling)" },
+                        config.agent.model
+                    );
+
+                    // ── Stream channel + forwarder ──
+                    let (stream_tx, mut stream_rx) =
+                        tokio::sync::mpsc::channel::<StreamChunk>(128);
+                    let stream_outgoing = outgoing_tx.clone();
+                    let stream_to = from_id_owned.clone();
+                    let stream_forwarder = tokio::spawn(async move {
+                        while let Some(chunk) = stream_rx.recv().await {
+                            // AICQ stream_chunk schema (per aicqSDK):
+                            //   {type:"stream_chunk", to:<friend_id>, chunkType:"text"|"thinking", data:"..."}
+                            let chunk_type_str = match chunk.chunk_type.as_str() {
+                                "thinking" | "think" => "thinking",
+                                _ => "text",
+                            };
+                            let msg = serde_json::json!({
+                                "type": "stream_chunk",
+                                "to": stream_to,
+                                "chunkType": chunk_type_str,
+                                "data": chunk.data,
+                            });
+                            if stream_outgoing
+                                .send(tungstenite::Message::Text(msg.to_string()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
+                    });
 
-                        let session = session_guard.as_mut().unwrap();
-                        
-                        // Chat with timeout
-                        tokio::time::timeout(
-                            Duration::from_secs(300),
-                            session.chat(&content_owned, None)
-                        ).await
-                    }; // session_guard is dropped here, releasing the mutex
+                    // ── Run chat (Agent or Normal) ──
+                    let chat_result: Result<browser::BrowserChatResult, anyhow::Error> = if agent_mode {
+                        // Agent mode: browser fetch hijack
+                        let stream_tx_for_cb = stream_tx.clone();
+                        let cb: StreamCallback = Box::new(move |delta: &str, is_thinking: bool| {
+                            let chunk = StreamChunk {
+                                chunk_type: if is_thinking { "thinking".to_string() } else { "reply".to_string() },
+                                data: delta.to_string(),
+                            };
+                            let _ = stream_tx_for_cb.try_send(chunk);
+                        });
+                        let agent_model = config.agent.model.clone();
+                        let agent_message = content_owned.clone();
+                        let agent_auth = auth.clone();
 
-                    match browser_result {
-                        Ok(Ok(result)) => {
+                        match tokio::time::timeout(
+                            Duration::from_secs(180),
+                            browser::chat_via_browser_agent(
+                                &agent_auth,
+                                &agent_message,
+                                &agent_model,
+                                Some(&cb),
+                            ),
+                        ).await {
+                            Ok(Ok(r)) => Ok(r),
+                            Ok(Err(e)) => Err(e),
+                            Err(_) => Err(anyhow::anyhow!("Agent mode timed out (3 minutes)")),
+                        }
+                    } else {
+                        // Normal chat: BrowserSession (DOM polling, also streams)
+                        let browser_result = {
+                            let mut session_guard = browser_session.lock().await;
+                            if session_guard.is_none() {
+                                tracing::info!("Creating new BrowserSession...");
+                                *session_guard = Some(BrowserSession::new(&auth));
+                            }
+                            let session = session_guard.as_mut().unwrap();
+                            tokio::time::timeout(
+                                Duration::from_secs(300),
+                                session.chat(&content_owned, Some(stream_tx.clone())),
+                            ).await
+                        };
+                        match browser_result {
+                            Ok(Ok(r)) => Ok(r),
+                            Ok(Err(e)) => Err(e),
+                            Err(_) => Err(anyhow::anyhow!("Browser chat timed out (5 minutes)")),
+                        }
+                    };
+
+                    // Drop our copy of stream_tx so the forwarder can flush and exit
+                    drop(stream_tx);
+                    // Wait for forwarder to finish sending all queued chunks
+                    let _ = stream_forwarder.await;
+
+                    // Send stream_end signal so AICQ clients know the stream is done
+                    {
+                        let end_msg = serde_json::json!({
+                            "type": "stream_end",
+                            "to": from_id_owned,
+                        });
+                        let _ = outgoing_tx
+                            .send(tungstenite::Message::Text(end_msg.to_string()))
+                            .await;
+                    }
+
+                    // ── Agent mode fallback: if Agent failed and we have a
+                    // non-Agent model available, retry once with normal chat.
+                    // (GLM-5.2 frequently returns MODEL_CONCURRENCY_LIMIT or
+                    // WORKSPACE_TOOL_INIT_ERROR, so falling back to normal
+                    // chat keeps the bot responsive.)
+                    let result = match chat_result {
+                        Ok(r) => Ok(r),
+                        Err(e) if agent_mode => {
+                            tracing::warn!(
+                                "Agent mode failed ({}); falling back to normal chat",
+                                e
+                            );
+                            // Reset any browser session so the fallback gets a fresh one
+                            {
+                                let mut session_guard = browser_session.lock().await;
+                                *session_guard = None;
+                            }
+                            let (fb_tx, mut fb_rx) =
+                                tokio::sync::mpsc::channel::<StreamChunk>(128);
+                            let fb_outgoing = outgoing_tx.clone();
+                            let fb_to = from_id_owned.clone();
+                            let fb_forwarder = tokio::spawn(async move {
+                                while let Some(chunk) = fb_rx.recv().await {
+                                    let chunk_type_str = match chunk.chunk_type.as_str() {
+                                        "thinking" | "think" => "thinking",
+                                        _ => "text",
+                                    };
+                                    let msg = serde_json::json!({
+                                        "type": "stream_chunk",
+                                        "to": fb_to,
+                                        "chunkType": chunk_type_str,
+                                        "data": chunk.data,
+                                    });
+                                    if fb_outgoing
+                                        .send(tungstenite::Message::Text(msg.to_string()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            });
+                            let fb_auth = auth.clone();
+                            let fb_result = {
+                                let mut session_guard = browser_session.lock().await;
+                                if session_guard.is_none() {
+                                    *session_guard = Some(BrowserSession::new(&fb_auth));
+                                }
+                                let session = session_guard.as_mut().unwrap();
+                                tokio::time::timeout(
+                                    Duration::from_secs(300),
+                                    session.chat(&content_owned, Some(fb_tx.clone())),
+                                ).await
+                            };
+                            drop(fb_tx);
+                            let _ = fb_forwarder.await;
+                            // Send another stream_end after fallback
+                            let end_msg = serde_json::json!({
+                                "type": "stream_end",
+                                "to": from_id_owned,
+                            });
+                            let _ = outgoing_tx
+                                .send(tungstenite::Message::Text(end_msg.to_string()))
+                                .await;
+                            match fb_result {
+                                Ok(Ok(r)) => Ok(r),
+                                Ok(Err(e2)) => Err(e2),
+                                Err(_) => Err(anyhow::anyhow!("Fallback browser chat timed out (5 minutes)")),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    };
+
+                    // ── Process final result ──
+                    match result {
+                        Ok(result) => {
                             if !result.reply.is_empty() {
                                 // Strip user message from beginning of reply if present
-                                // Only strip if the user message is followed by a clear separator (newline)
-                                // to avoid cutting off the AI's actual response (e.g., "你好！" should not
-                                // be stripped to "！" just because the user said "你好")
                                 let clean_reply = {
                                     let reply = result.reply.trim();
                                     let user_msg = content_owned.trim();
-                                    
                                     if reply.starts_with(user_msg) && reply.len() > user_msg.len() {
                                         let after = &reply[user_msg.len()..];
-                                        // Only strip if followed by a newline (clear separator)
-                                        // This prevents stripping "你好" from "你好！" which is the AI's response
                                         if after.starts_with('\n') || after.starts_with("\r\n") {
                                             tracing::info!("Stripping user message prefix from reply ({} chars)", user_msg.len());
                                             after.trim_start().to_string()
                                         } else {
-                                            // No separator - this is the AI's own response starting with the same word
-                                            tracing::debug!("Reply starts with user message but no separator, keeping as-is");
                                             reply.to_string()
                                         }
                                     } else if reply == user_msg {
-                                        // Reply is exactly the user message echoed back - no actual AI response
                                         tracing::warn!("Reply is exactly the user message, likely echo");
                                         String::new()
                                     } else {
@@ -736,7 +895,7 @@ impl AgentRuntime {
                                 };
 
                                 let clean_reply_len = clean_reply.len();
-                                let clean_reply_preview: String = clean_reply.chars().take(80).collect();
+                                let _clean_reply_preview: String = clean_reply.chars().take(80).collect();
 
                                 // Build the full message: include thinking if present
                                 let full_reply = if !result.thinking.is_empty() {
@@ -752,10 +911,11 @@ impl AgentRuntime {
                                 tracing::info!("Extracted - thinking: {} chars, reply: {} chars, clean_reply: {} chars",
                                     result.thinking.len(), result.reply.len(), clean_reply_len);
 
-                                // Send reply via the MPSC channel
+                                // Send the final complete message (covers clients that
+                                // don't merge stream_chunk sequences on their own).
                                 let my_id = {
                                     let acct = server_account_id.lock().await;
-                                    acct.as_deref().unwrap_or(&config.agent.agent_id).to_string()
+                                    acct.as_deref().unwrap_or(&config.agent.agent_id).to_string();
                                 };
 
                                 let msg_id = format!("msg_{}_{}", chrono::Utc::now().timestamp_millis(), &uuid::Uuid::new_v4().to_string()[..8]);
@@ -777,7 +937,7 @@ impl AgentRuntime {
 
                                 match outgoing_tx.send(tungstenite::Message::Text(msg.to_string())).await {
                                     Ok(_) => {
-                                        tracing::info!("Reply sent via browser (thinking: {} chars, reply: {} chars)", result.thinking.len(), result.reply.len());
+                                        tracing::info!("Reply sent (thinking: {} chars, reply: {} chars)", result.thinking.len(), result.reply.len());
                                     }
                                     Err(e) => {
                                         tracing::error!("Failed to send reply through channel: {}", e);
@@ -797,19 +957,12 @@ impl AgentRuntime {
                                 tracing::warn!("Empty reply from browser chat");
                             }
                         }
-                        Ok(Err(be)) => {
-                            tracing::error!("Browser chat failed: {}", be);
+                        Err(e) => {
+                            tracing::error!("Browser chat failed: {}", e);
                             // Reset session on error so it's re-initialized next time
                             let mut session_guard = browser_session.lock().await;
                             *session_guard = None;
                             send_error_reply(&outgoing_tx, &from_id_owned, &server_account_id, &config, "抱歉，生成回复时出错了。请稍后再试。").await;
-                        }
-                        Err(_) => {
-                            tracing::error!("Browser chat timed out (5 minutes)");
-                            // Reset session on timeout
-                            let mut session_guard = browser_session.lock().await;
-                            *session_guard = None;
-                            send_error_reply(&outgoing_tx, &from_id_owned, &server_account_id, &config, "抱歉，回复生成超时。请稍后再试。").await;
                         }
                     }
                 }

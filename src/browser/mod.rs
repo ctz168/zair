@@ -1859,6 +1859,19 @@ pub async fn chat_via_browser_agent(
                             parsed.features.vlm_tools_enable = false;
                             parsed.features.vlm_web_search_enable = false;
                             parsed.features.vlm_website_mode = false;
+                            // ── Strip fields that trigger server-side MCP init ──
+                            // The browser includes `tools`, `workspace_id`,
+                            // `background_tasks`, etc. — when any of these is
+                            // present, chat.z.ai tries to spin up MCP servers
+                            // (vibe-coding etc.) which 500s out. Removing them
+                            // keeps the request in pure chat+thinking mode.
+                            parsed.tools = [];
+                            parsed.tool_choice = "none";
+                            delete parsed.workspace_id;
+                            delete parsed.mcp_servers;
+                            delete parsed.background_tasks;
+                            delete parsed.plugins;
+                            delete parsed.agent_config;
                             // Re-encode
                             const newBody = JSON.stringify(parsed);
                             // Save the MODIFIED body (after our changes) for diagnostics
@@ -2211,6 +2224,20 @@ pub async fn chat_via_browser_agent(
                     tracing::info!(
                         "Browser sent chat request: model={}, flags=[{}], captcha_len={}, messages[0].content={:?}",
                         model_used, flags, captcha_len, msg_content
+                    );
+                    // Dump full request body and top-level keys for diagnosing
+                    // server-side errors (e.g. WORKSPACE_TOOL_INIT_ERROR from
+                    // an unwanted `tools` / `workspace_id` field).
+                    let top_keys: Vec<String> = rb.as_object()
+                        .map(|o| o.keys().cloned().collect())
+                        .unwrap_or_default();
+                    tracing::info!(
+                        "Request body top-level keys: {:?}",
+                        top_keys
+                    );
+                    tracing::info!(
+                        "Full request body: {}",
+                        serde_json::to_string(&rb).unwrap_or_default()
                     );
                 }
             }
