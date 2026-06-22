@@ -708,6 +708,765 @@ impl BrowserSession {
         Ok(())
     }
 
+    /// Chat with Z.AI in Agent mode (GLM-5.x) using browser fetch hijack.
+    ///
+    /// Reuses the persistent Chrome session across calls — first call
+    /// launches Chrome + navigates + injects cookies (~5-10s), subsequent
+    /// calls skip that init and just install the fetch hook + trigger the
+    /// chat (~10-15s instead of ~80s).
+    ///
+    /// The fetch hook:
+    ///   - captures the request body (with captcha_verify_param)
+    ///   - rewrites messages[0].content to zair's message
+    ///   - rewrites model to zair's model
+    ///   - strips tools/workspace_id/background_tasks/mcp_servers to avoid
+    ///     server-side MCP init errors
+    ///   - intercepts response stream, accumulates SSE text chunks
+    ///
+    /// The captured SSE chunks are parsed for `choices[0].delta.reasoning_content`
+    /// (thinking) and `choices[0].delta.content` (reply), and forwarded to the
+    /// callback in real time.
+    pub async fn chat_agent(
+        &mut self,
+        message: &str,
+        model: &str,
+        callback: Option<&crate::client::StreamCallback>,
+    ) -> Result<BrowserChatResult> {
+    let start = std::time::Instant::now();
+    tracing::info!("Starting browser Agent chat: model={}, message_len={}", model, message.len());
+
+    // Pre-escape message and model for use in JS template strings
+    let escaped_msg = message
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "");
+    let escaped_model = model
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+
+    self.ensure_running().await?;
+
+    let ws_url = get_page_ws_url_for_port(self.port).await?;
+    let mut cdp = CdpConnection::connect(&ws_url).await?;
+    cdp.send_notification("Page.enable").await?;
+    cdp.send_notification("Network.enable").await?;
+    cdp.send_notification("Runtime.enable").await?;
+
+    if !self.initialized {
+        // Navigate + inject cookies + reload (full session init)
+        tracing::info!("Navigating to chat.z.ai for Agent chat...");
+        cdp.navigate("https://chat.z.ai/").await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // ── Set localStorage to default to the target model ──
+        // chat.z.ai stores the selected model in localStorage.selectedModels.
+        // By setting it to ["glm-5.2"] BEFORE reload, the page loads with
+        // GLM-5.2 as the default model, which means:
+        //   1. The model selector button shows "GLM-5.2"
+        //   2. New conversations are created in Agent mode (GLM-5.2 = Agent)
+        //   3. The browser's chat request naturally includes flags=["general_agent"]
+        //
+        // This is the ONLY reliable way to switch to Agent mode — clicking the
+        // dropdown via JS .click() often doesn't trigger Svelte's event handlers.
+        let set_model_js = format!(r#"
+            (function(){{
+                localStorage.setItem('selectedModels', JSON.stringify(['{escaped_model}']));
+                localStorage.setItem('last_selected_agent_model', JSON.stringify(['{escaped_model}']));
+                localStorage.setItem('last_mode', 'agent');
+                return 'set_selectedModels=' + localStorage.getItem('selectedModels');
+            }})()
+        "#);
+        let set_result = cdp.evaluate(&set_model_js).await?;
+        tracing::info!("Set localStorage selectedModels: {:?}", set_result);
+
+        inject_stealth_via_cdp(&mut cdp).await?;
+        inject_cookies_cdp(&mut cdp, &self.auth_state.cookie).await?;
+
+        // Reload to apply the localStorage settings
+        cdp.evaluate("location.reload(true)").await?;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Verify model selector now shows the target model
+        let verify_model_js = format!(r#"
+            (function(){{
+                const sel = document.querySelector('button.modelSelectorButton, button[aria-label="选择一个模型"]');
+                if (!sel) return 'no_selector';
+                const text = (sel.innerText || '').trim();
+                return JSON.stringify({{buttonText: text, contains_target: text.includes('{escaped_model}'), selectedModels: localStorage.getItem('selectedModels')}});
+            }})()
+        "#);
+        let model_check = cdp.evaluate(&verify_model_js).await?;
+        tracing::info!("Model selector after localStorage set: {:?}", model_check);
+
+        // Verify we're logged in
+        let check = cdp.evaluate(r#"
+            (() => {
+                const ta = document.querySelector('textarea');
+                return JSON.stringify({
+                    url: window.location.href,
+                    hasTextarea: ta !== null,
+                    hasAuth: document.cookie.includes('token=') || document.cookie.includes('chatglm'),
+                });
+            })()
+        "#).await?;
+        tracing::info!("Page state: {:?}", check);
+
+        self.initialized = true;
+    }
+
+    // ── Start a fresh conversation before each chat ──
+    // Without this, a previous error (e.g. MODEL_CONCURRENCY_LIMIT) leaves
+    // the page in a broken state — the next "Send click" returns "clicked"
+    // but no fetch is actually fired, so the SSE poll times out after 120s
+    // with zero chunks. Clicking "New Chat" (or navigating to /) clears
+    // the error toast and gives us a clean conversation.
+    let reset_js = r#"
+        (function(){
+            // Try clicking sidebar "New Chat" / "新对话" link first
+            const links = document.querySelectorAll('a[href="/"], a[href="/c"], [class*="new-chat"], [class*="newChat"]');
+            for (const link of links) {
+                const t = link.innerText || '';
+                if (t.includes('新对话') || t.includes('New') || link.getAttribute('href') === '/') {
+                    link.click();
+                    return 'clicked_new_chat';
+                }
+            }
+            const buttons = document.querySelectorAll('button');
+            for (const btn of buttons) {
+                const t = btn.innerText || '';
+                if (t.includes('新对话') || t.includes('New Chat') || t.includes('新建')) {
+                    btn.click();
+                    return 'clicked_new_button';
+                }
+            }
+            return 'no_new_chat';
+        })()
+    "#;
+    let reset_result = cdp.evaluate(reset_js).await?;
+    tracing::info!("Pre-chat reset: {:?}", reset_result);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // ── Install fetch hook that hijacks the chat request ──
+    // The hook:
+    //   - captures the request body (with captcha_verify_param)
+    //   - rewrites messages[0].content to zair's message
+    //   - rewrites model to zair's model
+    //   - sets stream=true
+    //   - calls original fetch with modified body
+    //   - intercepts response stream, accumulates SSE text chunks
+    // (escaped_msg and escaped_model are already defined at the top of this function)
+
+    let install_js = format!(r#"
+        (function(){{
+            // Reset capture state
+            window.__zair_agent_chat = {{
+                request_body: null,
+                chunks: [],
+                done: false,
+                error: null,
+                started_at: Date.now(),
+                last_chunk_at: 0,
+            }};
+            if (window.__zair_agent_hook_installed) {{
+                // Hook already installed — just reset state (done above)
+                return 'already_installed';
+            }}
+            window.__zair_agent_hook_installed = true;
+            const origFetch = window.fetch;
+            window.fetch = async function(input, init) {{
+                const url = (typeof input === 'string') ? input : (input && input.url) || '';
+                const method = (init && init.method) || (input && input.method) || 'GET';
+                if (method.toUpperCase() === 'POST' && url.includes('/chat/completions')) {{
+                    try {{
+                        // Handle both fetch(url, init) and fetch(Request, init) patterns.
+                        // If input is a Request object, we must extract its body and
+                        // rebuild a new init — modifying init.body alone won't work
+                        // because the Request's body takes precedence.
+                        let bodyStr = '';
+                        if (init && init.body) {{
+                            const body = init.body;
+                            if (typeof body === 'string') bodyStr = body;
+                            else if (body instanceof Blob) bodyStr = await body.text();
+                            else if (body instanceof ArrayBuffer) bodyStr = new TextDecoder().decode(body);
+                        }} else if (input instanceof Request) {{
+                            // Clone the request and read its body
+                            const cloned = input.clone();
+                            bodyStr = await cloned.text();
+                        }}
+                        if (bodyStr) {{
+                            const parsed = JSON.parse(bodyStr);
+                            // ── MINIMAL HIJACK ──
+                            // Only override the user message content, signature_prompt,
+                            // and model. Let the browser send its native features, tools,
+                            // workspace_id, mcp_servers, etc. as-is — the server needs
+                            // these to initialize the Agent mode MCP servers correctly.
+                            // (Previously we stripped tools/workspace_id/mcp_servers,
+                            //  which caused WORKSPACE_TOOL_INIT_ERROR.)
+                            parsed.messages = [{{role: 'user', content: "{escaped_msg}"}}];
+                            parsed.signature_prompt = "{escaped_msg}";
+                            parsed.model = "{escaped_model}";
+                            parsed.stream = true;
+                            // Ensure Agent mode flag is present (in case the browser
+                            // forgot it — usually it's already there for glm-5.* models).
+                            parsed.features = parsed.features || {{}};
+                            if (!Array.isArray(parsed.features.flags)) {{
+                                parsed.features.flags = [];
+                            }}
+                            if (!parsed.features.flags.includes('general_agent')) {{
+                                parsed.features.flags.push('general_agent');
+                            }}
+                            // Re-encode
+                            const newBody = JSON.stringify(parsed);
+                            // Save the MODIFIED body (after our changes) for diagnostics
+                            window.__zair_agent_chat.request_body = JSON.parse(newBody);
+                            // If input is a Request, rebuild a new Request with the modified body
+                            if (input instanceof Request) {{
+                                const newInit = {{
+                                    method: input.method,
+                                    headers: input.headers,
+                                    body: newBody,
+                                    credentials: input.credentials,
+                                    mode: input.mode,
+                                }};
+                                return origFetch.call(this, input.url, newInit);
+                            }} else {{
+                                init = init || {{}};
+                                init.body = newBody;
+                            }}
+                        }}
+                    }} catch(e) {{
+                        console.error('[zair] fetch hook error:', e);
+                    }}
+                }}
+                // Call original fetch
+                const response = await origFetch.apply(this, arguments);
+                // If this was the chat completions request, intercept the response stream
+                if (method.toUpperCase() === 'POST' && url.includes('/chat/completions') && response.body) {{
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    const state = window.__zair_agent_chat;
+                    (async function() {{
+                        try {{
+                            while (true) {{
+                                const {{ done, value }} = await reader.read();
+                                if (done) break;
+                                const text = decoder.decode(value, {{ stream: true }});
+                                state.chunks.push({{ ts: Date.now(), text }});
+                                state.last_chunk_at = Date.now();
+                            }}
+                            state.done = true;
+                        }} catch(e) {{
+                            state.done = true;
+                            state.error = e.message;
+                        }}
+                    }})();
+                    // Return a tee'd stream so the page's own JS (which expects a
+                    // response) still works. We use response.clone() which
+                    // internally tees the body.
+                    return response.clone();
+                }}
+                return response;
+            }};
+            return 'installed';
+        }})()
+    "#);
+    let install_result = cdp.evaluate(&install_js).await?;
+    tracing::info!("Agent hook install: {:?}", install_result);
+
+    // ── Select the model in the UI ──
+    // This is CRITICAL: if the UI doesn't switch to GLM-5.2, the new
+    // conversation is created in chat mode (GLM-4.7 default), and even
+    // though our fetch hook forces flags=[general_agent], the server
+    // stores the message under a chat-mode conversation.
+    //
+    // We must: open dropdown → wait for items → click GLM-5.2 → verify.
+    //
+    // OPTIMIZATION: if the selector button already shows the target model
+    // (case-insensitive), skip the whole dropdown dance — it saves ~6s
+    // per call. This is the common case after we set localStorage.
+    let preverify_js = format!(r#"
+        (function(){{
+            const sel = document.querySelector('button.modelSelectorButton, button[aria-label="选择一个模型"]');
+            if (!sel) return JSON.stringify({{ready: false, contains_target: false, text: ''}});
+            const text = (sel.innerText || '').trim();
+            const lower = text.toLowerCase();
+            const target = "{escaped_model}".toLowerCase();
+            return JSON.stringify({{ready: true, contains_target: lower.includes(target), text: text}});
+        }})()
+    "#);
+    let mut already_selected = false;
+    for _ in 0..10 {
+        let r = cdp.evaluate(&preverify_js).await?;
+        if let Some(s) = r.as_str() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                let ready = v.get("ready").and_then(|b| b.as_bool()).unwrap_or(false);
+                let contains = v.get("contains_target").and_then(|b| b.as_bool()).unwrap_or(false);
+                if ready && contains {
+                    already_selected = true;
+                    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    tracing::info!("✓ Model already selected (buttonText={}): skipping dropdown", text);
+                    break;
+                }
+                if ready {
+                    // Button is present but model is not the target — stop waiting
+                    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    tracing::info!("Model selector ready but shows '{}', need dropdown switch", text);
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    if already_selected {
+        // Skip dropdown entirely — model is already the target.
+        // Fast-path: jump straight to typing + sending.
+    } else {
+    // Step 1: Wait for the model selector button to be present
+    let wait_selector_js = r#"
+        (function(){
+            const sel = document.querySelector('button.modelSelectorButton, button[aria-label="选择一个模型"]');
+            return sel ? 'ready:' + (sel.innerText || '').trim().substring(0, 30) : 'not_found';
+        })()
+    "#;
+    let mut selector_ready = false;
+    for _ in 0..20 {
+        let r = cdp.evaluate(wait_selector_js).await?;
+        if let Some(s) = r.as_str() {
+            if s.starts_with("ready:") {
+                tracing::info!("Model selector ready: {}", s);
+                selector_ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if !selector_ready {
+        tracing::warn!("Model selector button not found after 10s");
+    }
+
+    // Step 2: Open the dropdown
+    cdp.evaluate(r#"
+        (function(){
+            const sel = document.querySelector('button.modelSelectorButton, button[aria-label="选择一个模型"]');
+            if (sel) { sel.click(); return 'opened'; }
+            return 'no_selector';
+        })()
+    "#).await?;
+
+    // Step 3: Wait for the dropdown to render a VISIBLE GLM-5.2 item.
+    // The dropdown popup appears immediately, but its items start hidden
+    // (CSS transition) and become visible after ~500ms. We poll for a
+    // VISIBLE element whose text contains exactly "GLM-5.2" on one line.
+    let wait_item_js = format!(r#"
+        (function(){{
+            const target = "{escaped_model}";
+            const all = document.querySelectorAll('*');
+            for (var el of all) {{
+                // Must be visible (offsetParent !== null)
+                if (!el.offsetParent && el.tagName !== 'BODY') continue;
+                var txt = (el.innerText || '').trim();
+                if (!txt || txt.length > 200) continue;
+                var lines = txt.split('\n').map(s => s.trim()).filter(s => s);
+                for (var line of lines) {{
+                    if (line === target) {{
+                        return JSON.stringify({{found: true, tag: el.tagName, class: (el.className||'').substring(0,80), text: line}});
+                    }}
+                }}
+            }}
+            return JSON.stringify({{found: false}});
+        }})()
+    "#);
+    let mut item_found = false;
+    for _ in 0..20 {  // 20 x 300ms = 6s max
+        let r = cdp.evaluate(&wait_item_js).await?;
+        if let Some(s) = r.as_str() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                if v.get("found").and_then(|b| b.as_bool()).unwrap_or(false) {
+                    item_found = true;
+                    tracing::info!(
+                        "GLM-5.2 dropdown item visible: {:?}",
+                        v.get("text")
+                    );
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    if !item_found {
+        tracing::warn!("GLM-5.2 item not VISIBLE in dropdown after 6s");
+    }
+
+    // Step 4: Click the GLM-5.2 item
+    let model_pick_js = format!(r#"
+        (function(){{
+            const target = "{escaped_model}";
+            const candidates = document.querySelectorAll('[role="option"], [role="menuitem"], [role="button"], li, div, button');
+            // First pass: exact line match
+            for (var c of candidates) {{
+                var txt = (c.innerText || '').trim();
+                var lines = txt.split('\n').map(s => s.trim()).filter(s => s);
+                for (var line of lines) {{
+                    if (line === target) {{
+                        c.click();
+                        return 'clicked_exact: ' + line;
+                    }}
+                }}
+            }}
+            // Second pass: line starts with target (but not target + ".")
+            for (var c of candidates) {{
+                var txt = (c.innerText || '').trim();
+                var lines = txt.split('\n').map(s => s.trim()).filter(s => s);
+                for (var line of lines) {{
+                    if (line.startsWith(target) && !line.startsWith(target + '.')) {{
+                        c.click();
+                        return 'clicked_prefix: ' + line;
+                    }}
+                }}
+            }}
+            return 'model_not_found: ' + target;
+        }})()
+    "#);
+    let pick_result = cdp.evaluate(&model_pick_js).await?;
+    tracing::info!("Model pick: {:?}", pick_result);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // Step 5: Verify the model selector button now shows the target model.
+    // This confirms the UI actually switched — if it didn't, the new
+    // conversation will be created in chat mode (GLM-4.7) regardless of
+    // what our fetch hook forces in the request body.
+    let verify_js = format!(r#"
+        (function(){{
+            const sel = document.querySelector('button.modelSelectorButton, button[aria-label="选择一个模型"]');
+            if (!sel) return 'no_selector';
+            const text = (sel.innerText || '').trim();
+            // Case-insensitive check — buttonText is "GLM-5.2" but escaped_model
+            // is "glm-5.2". Comparing in lowercase fixes the false-negative that
+            // previously caused 6s of pointless dropdown-retry every call.
+            const lower = text.toLowerCase();
+            const target = "{escaped_model}".toLowerCase();
+            return JSON.stringify({{buttonText: text, contains_target: lower.includes(target)}});
+        }})()
+    "#);
+    let verify_result = cdp.evaluate(&verify_js).await?;
+    tracing::info!("Model selector verify: {:?}", verify_result);
+
+    // Check if verification shows the target model is selected
+    let mut model_confirmed = false;
+    if let Some(s) = verify_result.as_str() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+            if v.get("contains_target").and_then(|b| b.as_bool()).unwrap_or(false) {
+                model_confirmed = true;
+                tracing::info!("✓ Model UI confirmed: {} is selected", escaped_model);
+            }
+        }
+    }
+    if !model_confirmed {
+        tracing::warn!(
+            "✗ Model UI did NOT switch to {} — the conversation will be created in chat mode. \
+            Attempting retry with keyboard navigation...",
+            escaped_model
+        );
+        // Retry: open dropdown again and try clicking with mouse events
+        cdp.evaluate(r#"
+            (function(){
+                const sel = document.querySelector('button.modelSelectorButton, button[aria-label="选择一个模型"]');
+                if (sel) { sel.click(); return 'reopened'; }
+                return 'no_selector';
+            })()
+        "#).await?;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+
+        // Try a broader match — any element whose first line is exactly the target
+        let retry_pick_js = format!(r#"
+            (function(){{
+                const target = "{escaped_model}";
+                // Find ALL elements and check their direct text content (not children)
+                const all = document.querySelectorAll('*');
+                for (var el of all) {{
+                    // Check if this element's DIRECT text (ignoring children) matches
+                    var directText = '';
+                    for (var child of el.childNodes) {{
+                        if (child.nodeType === 3) directText += child.textContent;
+                    }}
+                    directText = directText.trim();
+                    if (directText === target) {{
+                        // Found the element — click it and its parent
+                        el.click();
+                        var parent = el.closest('[role="option"], [role="button"], li, div, button') || el.parentElement;
+                        if (parent && parent !== el) parent.click();
+                        return 'retry_clicked: ' + directText;
+                    }}
+                }}
+                return 'retry_not_found';
+            }})()
+        "#);
+        let retry_result = cdp.evaluate(&retry_pick_js).await?;
+        tracing::info!("Model pick retry: {:?}", retry_result);
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+
+        // Verify again
+        let verify2 = cdp.evaluate(&verify_js).await?;
+        tracing::info!("Model selector verify (2nd): {:?}", verify2);
+        if let Some(s) = verify2.as_str() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                if v.get("contains_target").and_then(|b| b.as_bool()).unwrap_or(false) {
+                    model_confirmed = true;
+                    tracing::info!("✓ Model UI confirmed on retry: {} is selected", escaped_model);
+                }
+            }
+        }
+    }
+    } // end of `else { dropdown dance }` block
+
+    // ── Type a placeholder message and click send ──
+    // The fetch hook will rewrite the content to zair's message, so the
+    // placeholder value doesn't matter — it just needs to enable the send button.
+    cdp.evaluate(r#"
+        (function(){
+            const ta = document.querySelector('textarea');
+            if (!ta) return 'no_textarea';
+            ta.focus();
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+            setter.call(ta, 'placeholder');
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+            ta.dispatchEvent(new Event('change', { bubbles: true }));
+            return 'typed';
+        })()
+    "#).await?;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Click send button
+    let click_result = cdp.evaluate(r#"
+        (function(){
+            const sendDivs = [...document.querySelectorAll('[aria-label]')].filter(el => {
+                const al = el.getAttribute('aria-label') || '';
+                return al.includes('发送') || al.includes('Send');
+            });
+            if (sendDivs.length === 0) return 'no_send_div';
+            const sendDiv = sendDivs[0];
+            const btn = sendDiv.querySelector('button') || sendDiv;
+            if (btn.disabled) return 'btn_disabled';
+            btn.click();
+            return 'clicked';
+        })()
+    "#).await?;
+    tracing::info!("Send click: {:?}", click_result);
+
+    // ── Poll for SSE chunks, forward to callback ──
+    let mut accumulated_content = String::new();
+    let mut thinking_content = String::new();
+    let mut current_mode = "text".to_string();
+    let mut tag_buffer = String::new();
+    let mut chunk_idx = 0usize;
+    let mut captured_conversation_id = String::new();
+    let mut request_body_seen = false;
+
+    // Wait up to 120s for the SSE stream to complete
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let poll_js = r#"
+        (function(){
+            const s = window.__zair_agent_chat || {};
+            return JSON.stringify({
+                chunks: s.chunks || [],
+                done: !!s.done,
+                error: s.error || null,
+                request_body: s.request_body || null,
+                last_chunk_at: s.last_chunk_at || 0,
+            });
+        })()
+    "#;
+
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let r = cdp.evaluate(poll_js).await?;
+        let s = match r.as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let v: serde_json::Value = match serde_json::from_str(s) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Log the captured request body once (for diagnostics)
+        if !request_body_seen {
+            if let Some(rb) = v.get("request_body") {
+                if !rb.is_null() {
+                    request_body_seen = true;
+                    let model_used = rb.get("model").and_then(|m| m.as_str()).unwrap_or("?");
+                    let flags = rb.get("features")
+                        .and_then(|f| f.get("flags"))
+                        .and_then(|f| f.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(","))
+                        .unwrap_or_default();
+                    let captcha_len = rb.get("captcha_verify_param")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.len())
+                        .unwrap_or(0);
+                    let msg_content = rb.get("messages")
+                        .and_then(|m| m.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("?");
+                    tracing::info!(
+                        "Browser sent chat request: model={}, flags=[{}], captcha_len={}, messages[0].content={:?}",
+                        model_used, flags, captcha_len, msg_content
+                    );
+                    // Dump full request body and top-level keys for diagnosing
+                    // server-side errors (e.g. WORKSPACE_TOOL_INIT_ERROR from
+                    // an unwanted `tools` / `workspace_id` field).
+                    let top_keys: Vec<String> = rb.as_object()
+                        .map(|o| o.keys().cloned().collect())
+                        .unwrap_or_default();
+                    tracing::info!(
+                        "Request body top-level keys: {:?}",
+                        top_keys
+                    );
+                    tracing::info!(
+                        "Full request body: {}",
+                        serde_json::to_string(&rb).unwrap_or_default()
+                    );
+                }
+            }
+        }
+
+        // Process any new chunks
+        if let Some(chunks) = v.get("chunks").and_then(|c| c.as_array()) {
+            while chunk_idx < chunks.len() {
+                let chunk_text = chunks[chunk_idx]
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                chunk_idx += 1;
+                if chunk_text.is_empty() { continue; }
+
+                // Parse each SSE line
+                for line in chunk_text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || !line.starts_with("data:") { continue; }
+                    let data_str = line[5..].trim();
+                    if data_str == "[DONE]" || data_str.is_empty() { continue; }
+                    let data: serde_json::Value = match serde_json::from_str(data_str) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+
+                    // Check for embedded business errors
+                    if let Some(err_msg) = crate::client::detect_embedded_error_pub(&data) {
+                        bail!("{}", err_msg);
+                    }
+
+                    // Capture conversation_id
+                    for field in &["conversation_id", "chat_id", "id"] {
+                        if let Some(cid) = data.get(*field).and_then(|v| v.as_str()) {
+                            if !cid.is_empty() { captured_conversation_id = cid.to_string(); }
+                        }
+                    }
+
+                    // Extract reasoning_content (thinking)
+                    if let Some(rc) = data.get("choices")
+                        .and_then(|c| c.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|c| c.get("delta"))
+                        .and_then(|d| d.get("reasoning_content"))
+                        .and_then(|r| r.as_str())
+                    {
+                        if !rc.is_empty() {
+                            thinking_content.push_str(rc);
+                            if let Some(cb) = callback {
+                                cb(rc, true);
+                            }
+                        }
+                    }
+
+                    // Extract content delta
+                    if let Some(content) = data.get("choices")
+                        .and_then(|c| c.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|c| c.get("delta"))
+                        .and_then(|d| d.get("content"))
+                        .and_then(|r| r.as_str())
+                    {
+                        if !content.is_empty() {
+                            crate::client::emit_delta_pub(
+                                content,
+                                &mut current_mode,
+                                &mut tag_buffer,
+                                &mut accumulated_content,
+                                &mut thinking_content,
+                                &callback,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check if done
+        let done = v.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
+        let err = v.get("error").and_then(|e| e.as_str());
+        if let Some(e) = err {
+            bail!("Browser SSE stream error: {}", e);
+        }
+        if done {
+            // Flush any remaining tag_buffer
+            if !tag_buffer.is_empty() {
+                if current_mode == "thinking" {
+                    thinking_content.push_str(&tag_buffer);
+                    if let Some(cb) = callback { cb(&tag_buffer, true); }
+                } else {
+                    accumulated_content.push_str(&tag_buffer);
+                    if let Some(cb) = callback { cb(&tag_buffer, false); }
+                }
+            }
+            tracing::info!(
+                "Browser Agent chat done: reply_chars={}, thinking_chars={}, elapsed={}ms",
+                accumulated_content.chars().count(),
+                thinking_content.chars().count(),
+                start.elapsed().as_millis()
+            );
+            break;
+        }
+    }
+
+    // Flush remaining tag buffer if we timed out
+    if !tag_buffer.is_empty() {
+        if current_mode == "thinking" {
+            thinking_content.push_str(&tag_buffer);
+        } else {
+            accumulated_content.push_str(&tag_buffer);
+        }
+    }
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    // ── Detect "no response" failure mode ──
+    // If neither the request_body was captured nor any chunks were received,
+    // the browser didn't actually fire a /chat/completions request — usually
+    // because the page was in a stale error state from a previous attempt.
+    // Return an error so the retry loop can either try again or fall back
+    // to chat-mode. Without this, chat_agent would return Ok with 0 chars
+    // and the caller would treat it as a successful empty reply.
+    if !request_body_seen && accumulated_content.is_empty() && thinking_content.is_empty() {
+        bail!(
+            "Agent mode produced no response (no fetch was intercepted within \
+             120s — the page may be in a stale error state). \
+             Treat as retryable / agent-unavailable."
+        );
+    }
+
+    Ok(BrowserChatResult {
+        reply: accumulated_content,
+        thinking: thinking_content,
+        raw_length: 0,
+        elapsed_ms,
+    })
+    }
+
     /// Chat with Z.AI using the persistent browser session.
     /// Reuses the Chrome instance across calls for much faster response times.
     pub async fn chat(
@@ -813,6 +1572,80 @@ impl BrowserSession {
 
         // Type message and poll for response
         type_message_and_poll(&mut cdp, message, stream_tx, start).await
+    }
+
+    /// Reset the persistent browser session back to non-Agent (chat) mode.
+    ///
+    /// This is used as a fallback when Agent mode (GLM-5.x) fails on the
+    /// server side (WORKSPACE_TOOL_INIT_ERROR, MODEL_CONCURRENCY_LIMIT, …).
+    /// It clears the localStorage entries that pin `selectedModels` to a
+    /// GLM-5.x model, reloads the page so the UI falls back to the default
+    /// chat model (e.g. GLM-4.7), and forces the next `chat()` call to
+    /// re-initialize the session.
+    pub async fn switch_to_chat_mode(&mut self) -> Result<()> {
+        self.ensure_running().await?;
+        let ws_url = get_page_ws_url_for_port(self.port).await?;
+        let mut cdp = CdpConnection::connect(&ws_url).await?;
+        cdp.send_notification("Page.enable").await?;
+        cdp.send_notification("Runtime.enable").await?;
+
+        // Make sure we're on chat.z.ai before touching localStorage
+        let cur_url = cdp.evaluate("window.location.href")
+            .await
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        if !cur_url.contains("chat.z.ai") {
+            cdp.navigate("https://chat.z.ai/").await?;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+
+        // Remove the Agent-mode-pinning localStorage entries. The site
+        // defaults to a non-Agent model when these are absent.
+        // NOTE: we observed that simply clearing `selectedModels` causes the
+        // site to fall back to `GLM-5.1` — which is *also* an Agent-mode
+        // model and hits the same MODEL_CONCURRENCY_LIMIT. So we explicitly
+        // pin `selectedModels=["glm-4.7"]` (a non-Agent chat model) instead.
+        let clear_js = r#"
+            (function(){
+                const before = {
+                    selectedModels: localStorage.getItem('selectedModels'),
+                    last_selected_agent_model: localStorage.getItem('last_selected_agent_model'),
+                    last_mode: localStorage.getItem('last_mode'),
+                };
+                localStorage.setItem('selectedModels', JSON.stringify(['glm-4.7']));
+                localStorage.removeItem('last_selected_agent_model');
+                localStorage.removeItem('last_mode');
+                return JSON.stringify({
+                    before: before,
+                    after_selectedModels: localStorage.getItem('selectedModels'),
+                });
+            })()
+        "#;
+        let clear_result = cdp.evaluate(clear_js).await?;
+        tracing::info!("Switched selectedModels to glm-4.7: {:?}", clear_result);
+
+        // Reload so the UI picks up the new (default) model
+        cdp.evaluate("location.reload(true)").await?;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        // Verify the model selector no longer shows a GLM-5.x model
+        let verify_js = r#"
+            (function(){
+                const sel = document.querySelector('button.modelSelectorButton, button[aria-label="选择一个模型"]');
+                if (!sel) return JSON.stringify({ready: false, text: ''});
+                const text = (sel.innerText || '').trim();
+                const lower = text.toLowerCase();
+                const is_agent = lower.includes('glm-5');
+                return JSON.stringify({ready: true, text: text, is_agent_model: is_agent});
+            })()
+        "#;
+        let verify_result = cdp.evaluate(verify_js).await?;
+        tracing::info!("After reset, model selector: {:?}", verify_result);
+
+        // Force re-initialization on next chat() call (textarea check etc.)
+        self.initialized = false;
+        Ok(())
     }
 
     /// Shutdown the browser session (kill Chrome)
@@ -1713,654 +2546,13 @@ pub async fn chat_via_browser_agent(
     model: &str,
     callback: Option<&StreamCallback>,
 ) -> Result<BrowserChatResult> {
-    let start = std::time::Instant::now();
-    tracing::info!("Starting browser Agent chat: model={}, message_len={}", model, message.len());
-
-    // Pre-escape message and model for use in JS template strings
-    let escaped_msg = message
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "");
-    let escaped_model = model
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-
+    // Thin wrapper: create a one-shot BrowserSession and delegate to
+    // BrowserSession::chat_agent. For repeated calls (AICQ agent), use
+    // BrowserSession::chat_agent directly so Chrome is reused.
     let mut session = BrowserSession::new(auth_state);
-    session.ensure_running().await?;
-
-    let ws_url = get_page_ws_url_for_port(9223).await?;
-    let mut cdp = CdpConnection::connect(&ws_url).await?;
-    cdp.send_notification("Page.enable").await?;
-    cdp.send_notification("Network.enable").await?;
-    cdp.send_notification("Runtime.enable").await?;
-
-    // Navigate + inject cookies + reload (full session init)
-    tracing::info!("Navigating to chat.z.ai for Agent chat...");
-    cdp.navigate("https://chat.z.ai/").await?;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // ── Set localStorage to default to the target model ──
-    // chat.z.ai stores the selected model in localStorage.selectedModels.
-    // By setting it to ["glm-5.2"] BEFORE reload, the page loads with
-    // GLM-5.2 as the default model, which means:
-    //   1. The model selector button shows "GLM-5.2"
-    //   2. New conversations are created in Agent mode (GLM-5.2 = Agent)
-    //   3. The browser's chat request naturally includes flags=["general_agent"]
-    //
-    // This is the ONLY reliable way to switch to Agent mode — clicking the
-    // dropdown via JS .click() often doesn't trigger Svelte's event handlers.
-    let set_model_js = format!(r#"
-        (function(){{
-            localStorage.setItem('selectedModels', JSON.stringify(['{escaped_model}']));
-            localStorage.setItem('last_selected_agent_model', JSON.stringify(['{escaped_model}']));
-            localStorage.setItem('last_mode', 'agent');
-            return 'set_selectedModels=' + localStorage.getItem('selectedModels');
-        }})()
-    "#);
-    let set_result = cdp.evaluate(&set_model_js).await?;
-    tracing::info!("Set localStorage selectedModels: {:?}", set_result);
-
-    inject_stealth_via_cdp(&mut cdp).await?;
-    inject_cookies_cdp(&mut cdp, &auth_state.cookie).await?;
-
-    // Reload to apply the localStorage settings
-    cdp.evaluate("location.reload(true)").await?;
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // Verify model selector now shows the target model
-    let verify_model_js = format!(r#"
-        (function(){{
-            const sel = document.querySelector('button.modelSelectorButton, button[aria-label="选择一个模型"]');
-            if (!sel) return 'no_selector';
-            const text = (sel.innerText || '').trim();
-            return JSON.stringify({{buttonText: text, contains_target: text.includes('{escaped_model}'), selectedModels: localStorage.getItem('selectedModels')}});
-        }})()
-    "#);
-    let model_check = cdp.evaluate(&verify_model_js).await?;
-    tracing::info!("Model selector after localStorage set: {:?}", model_check);
-
-    // Verify we're logged in
-    let check = cdp.evaluate(r#"
-        (() => {
-            const ta = document.querySelector('textarea');
-            return JSON.stringify({
-                url: window.location.href,
-                hasTextarea: ta !== null,
-                hasAuth: document.cookie.includes('token=') || document.cookie.includes('chatglm'),
-            });
-        })()
-    "#).await?;
-    tracing::info!("Page state: {:?}", check);
-
-    // ── Install fetch hook that hijacks the chat request ──
-    // The hook:
-    //   - captures the request body (with captcha_verify_param)
-    //   - rewrites messages[0].content to zair's message
-    //   - rewrites model to zair's model
-    //   - sets stream=true
-    //   - calls original fetch with modified body
-    //   - intercepts response stream, accumulates SSE text chunks
-    // (escaped_msg and escaped_model are already defined at the top of this function)
-
-    let install_js = format!(r#"
-        (function(){{
-            // Reset capture state
-            window.__zair_agent_chat = {{
-                request_body: null,
-                chunks: [],
-                done: false,
-                error: null,
-                started_at: Date.now(),
-                last_chunk_at: 0,
-            }};
-            if (window.__zair_agent_hook_installed) {{
-                // Hook already installed — just reset state (done above)
-                return 'already_installed';
-            }}
-            window.__zair_agent_hook_installed = true;
-            const origFetch = window.fetch;
-            window.fetch = async function(input, init) {{
-                const url = (typeof input === 'string') ? input : (input && input.url) || '';
-                const method = (init && init.method) || (input && input.method) || 'GET';
-                if (method.toUpperCase() === 'POST' && url.includes('/chat/completions')) {{
-                    try {{
-                        // Handle both fetch(url, init) and fetch(Request, init) patterns.
-                        // If input is a Request object, we must extract its body and
-                        // rebuild a new init — modifying init.body alone won't work
-                        // because the Request's body takes precedence.
-                        let bodyStr = '';
-                        if (init && init.body) {{
-                            const body = init.body;
-                            if (typeof body === 'string') bodyStr = body;
-                            else if (body instanceof Blob) bodyStr = await body.text();
-                            else if (body instanceof ArrayBuffer) bodyStr = new TextDecoder().decode(body);
-                        }} else if (input instanceof Request) {{
-                            // Clone the request and read its body
-                            const cloned = input.clone();
-                            bodyStr = await cloned.text();
-                        }}
-                        if (bodyStr) {{
-                            const parsed = JSON.parse(bodyStr);
-                            // Override the message content and model
-                            parsed.messages = [{{role: 'user', content: "{escaped_msg}"}}];
-                            parsed.signature_prompt = "{escaped_msg}";
-                            parsed.model = "{escaped_model}";
-                            parsed.stream = true;
-                            // Force Agent-mode features
-                            parsed.features = parsed.features || {{}};
-                            parsed.features.flags = ["general_agent"];
-                            parsed.features.enable_thinking = true;
-                            parsed.features.reasoning_effort = "max";
-                            parsed.features.image_generation = false;
-                            parsed.features.web_search = false;
-                            parsed.features.auto_web_search = false;
-                            parsed.features.preview_mode = true;
-                            parsed.features.vlm_tools_enable = false;
-                            parsed.features.vlm_web_search_enable = false;
-                            parsed.features.vlm_website_mode = false;
-                            // ── Strip fields that trigger server-side MCP init ──
-                            // The browser includes `tools`, `workspace_id`,
-                            // `background_tasks`, etc. — when any of these is
-                            // present, chat.z.ai tries to spin up MCP servers
-                            // (vibe-coding etc.) which 500s out. Removing them
-                            // keeps the request in pure chat+thinking mode.
-                            parsed.tools = [];
-                            parsed.tool_choice = "none";
-                            delete parsed.workspace_id;
-                            delete parsed.mcp_servers;
-                            delete parsed.background_tasks;
-                            delete parsed.plugins;
-                            delete parsed.agent_config;
-                            // Re-encode
-                            const newBody = JSON.stringify(parsed);
-                            // Save the MODIFIED body (after our changes) for diagnostics
-                            window.__zair_agent_chat.request_body = JSON.parse(newBody);
-                            // If input is a Request, rebuild a new Request with the modified body
-                            if (input instanceof Request) {{
-                                const newInit = {{
-                                    method: input.method,
-                                    headers: input.headers,
-                                    body: newBody,
-                                    credentials: input.credentials,
-                                    mode: input.mode,
-                                }};
-                                return origFetch.call(this, input.url, newInit);
-                            }} else {{
-                                init = init || {{}};
-                                init.body = newBody;
-                            }}
-                        }}
-                    }} catch(e) {{
-                        console.error('[zair] fetch hook error:', e);
-                    }}
-                }}
-                // Call original fetch
-                const response = await origFetch.apply(this, arguments);
-                // If this was the chat completions request, intercept the response stream
-                if (method.toUpperCase() === 'POST' && url.includes('/chat/completions') && response.body) {{
-                    const reader = response.body.getReader();
-                    const decoder = new TextDecoder();
-                    const state = window.__zair_agent_chat;
-                    (async function() {{
-                        try {{
-                            while (true) {{
-                                const {{ done, value }} = await reader.read();
-                                if (done) break;
-                                const text = decoder.decode(value, {{ stream: true }});
-                                state.chunks.push({{ ts: Date.now(), text }});
-                                state.last_chunk_at = Date.now();
-                            }}
-                            state.done = true;
-                        }} catch(e) {{
-                            state.done = true;
-                            state.error = e.message;
-                        }}
-                    }})();
-                    // Return a tee'd stream so the page's own JS (which expects a
-                    // response) still works. We use response.clone() which
-                    // internally tees the body.
-                    return response.clone();
-                }}
-                return response;
-            }};
-            return 'installed';
-        }})()
-    "#);
-    let install_result = cdp.evaluate(&install_js).await?;
-    tracing::info!("Agent hook install: {:?}", install_result);
-
-    // ── Select the model in the UI ──
-    // This is CRITICAL: if the UI doesn't switch to GLM-5.2, the new
-    // conversation is created in chat mode (GLM-4.7 default), and even
-    // though our fetch hook forces flags=[general_agent], the server
-    // stores the message under a chat-mode conversation.
-    //
-    // We must: open dropdown → wait for items → click GLM-5.2 → verify.
-
-    // Step 1: Wait for the model selector button to be present
-    let wait_selector_js = r#"
-        (function(){
-            const sel = document.querySelector('button.modelSelectorButton, button[aria-label="选择一个模型"]');
-            return sel ? 'ready:' + (sel.innerText || '').trim().substring(0, 30) : 'not_found';
-        })()
-    "#;
-    let mut selector_ready = false;
-    for _ in 0..20 {
-        let r = cdp.evaluate(wait_selector_js).await?;
-        if let Some(s) = r.as_str() {
-            if s.starts_with("ready:") {
-                tracing::info!("Model selector ready: {}", s);
-                selector_ready = true;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    if !selector_ready {
-        tracing::warn!("Model selector button not found after 10s");
-    }
-
-    // Step 2: Open the dropdown
-    cdp.evaluate(r#"
-        (function(){
-            const sel = document.querySelector('button.modelSelectorButton, button[aria-label="选择一个模型"]');
-            if (sel) { sel.click(); return 'opened'; }
-            return 'no_selector';
-        })()
-    "#).await?;
-
-    // Step 3: Wait for the dropdown to render a VISIBLE GLM-5.2 item.
-    // The dropdown popup appears immediately, but its items start hidden
-    // (CSS transition) and become visible after ~500ms. We poll for a
-    // VISIBLE element whose text contains exactly "GLM-5.2" on one line.
-    let wait_item_js = format!(r#"
-        (function(){{
-            const target = "{escaped_model}";
-            const all = document.querySelectorAll('*');
-            for (var el of all) {{
-                // Must be visible (offsetParent !== null)
-                if (!el.offsetParent && el.tagName !== 'BODY') continue;
-                var txt = (el.innerText || '').trim();
-                if (!txt || txt.length > 200) continue;
-                var lines = txt.split('\n').map(s => s.trim()).filter(s => s);
-                for (var line of lines) {{
-                    if (line === target) {{
-                        return JSON.stringify({{found: true, tag: el.tagName, class: (el.className||'').substring(0,80), text: line}});
-                    }}
-                }}
-            }}
-            return JSON.stringify({{found: false}});
-        }})()
-    "#);
-    let mut item_found = false;
-    for _ in 0..20 {  // 20 x 300ms = 6s max
-        let r = cdp.evaluate(&wait_item_js).await?;
-        if let Some(s) = r.as_str() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-                if v.get("found").and_then(|b| b.as_bool()).unwrap_or(false) {
-                    item_found = true;
-                    tracing::info!(
-                        "GLM-5.2 dropdown item visible: {:?}",
-                        v.get("text")
-                    );
-                    break;
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-    if !item_found {
-        tracing::warn!("GLM-5.2 item not VISIBLE in dropdown after 6s");
-    }
-
-    // Step 4: Click the GLM-5.2 item
-    let model_pick_js = format!(r#"
-        (function(){{
-            const target = "{escaped_model}";
-            const candidates = document.querySelectorAll('[role="option"], [role="menuitem"], [role="button"], li, div, button');
-            // First pass: exact line match
-            for (var c of candidates) {{
-                var txt = (c.innerText || '').trim();
-                var lines = txt.split('\n').map(s => s.trim()).filter(s => s);
-                for (var line of lines) {{
-                    if (line === target) {{
-                        c.click();
-                        return 'clicked_exact: ' + line;
-                    }}
-                }}
-            }}
-            // Second pass: line starts with target (but not target + ".")
-            for (var c of candidates) {{
-                var txt = (c.innerText || '').trim();
-                var lines = txt.split('\n').map(s => s.trim()).filter(s => s);
-                for (var line of lines) {{
-                    if (line.startsWith(target) && !line.startsWith(target + '.')) {{
-                        c.click();
-                        return 'clicked_prefix: ' + line;
-                    }}
-                }}
-            }}
-            return 'model_not_found: ' + target;
-        }})()
-    "#);
-    let pick_result = cdp.evaluate(&model_pick_js).await?;
-    tracing::info!("Model pick: {:?}", pick_result);
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    // Step 5: Verify the model selector button now shows the target model.
-    // This confirms the UI actually switched — if it didn't, the new
-    // conversation will be created in chat mode (GLM-4.7) regardless of
-    // what our fetch hook forces in the request body.
-    let verify_js = format!(r#"
-        (function(){{
-            const sel = document.querySelector('button.modelSelectorButton, button[aria-label="选择一个模型"]');
-            if (!sel) return 'no_selector';
-            const text = (sel.innerText || '').trim();
-            return JSON.stringify({{buttonText: text, contains_target: text.includes("{escaped_model}")}});
-        }})()
-    "#);
-    let verify_result = cdp.evaluate(&verify_js).await?;
-    tracing::info!("Model selector verify: {:?}", verify_result);
-
-    // Check if verification shows the target model is selected
-    let mut model_confirmed = false;
-    if let Some(s) = verify_result.as_str() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-            if v.get("contains_target").and_then(|b| b.as_bool()).unwrap_or(false) {
-                model_confirmed = true;
-                tracing::info!("✓ Model UI confirmed: {} is selected", escaped_model);
-            }
-        }
-    }
-    if !model_confirmed {
-        tracing::warn!(
-            "✗ Model UI did NOT switch to {} — the conversation will be created in chat mode. \
-            Attempting retry with keyboard navigation...",
-            escaped_model
-        );
-        // Retry: open dropdown again and try clicking with mouse events
-        cdp.evaluate(r#"
-            (function(){
-                const sel = document.querySelector('button.modelSelectorButton, button[aria-label="选择一个模型"]');
-                if (sel) { sel.click(); return 'reopened'; }
-                return 'no_selector';
-            })()
-        "#).await?;
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-
-        // Try a broader match — any element whose first line is exactly the target
-        let retry_pick_js = format!(r#"
-            (function(){{
-                const target = "{escaped_model}";
-                // Find ALL elements and check their direct text content (not children)
-                const all = document.querySelectorAll('*');
-                for (var el of all) {{
-                    // Check if this element's DIRECT text (ignoring children) matches
-                    var directText = '';
-                    for (var child of el.childNodes) {{
-                        if (child.nodeType === 3) directText += child.textContent;
-                    }}
-                    directText = directText.trim();
-                    if (directText === target) {{
-                        // Found the element — click it and its parent
-                        el.click();
-                        var parent = el.closest('[role="option"], [role="button"], li, div, button') || el.parentElement;
-                        if (parent && parent !== el) parent.click();
-                        return 'retry_clicked: ' + directText;
-                    }}
-                }}
-                return 'retry_not_found';
-            }})()
-        "#);
-        let retry_result = cdp.evaluate(&retry_pick_js).await?;
-        tracing::info!("Model pick retry: {:?}", retry_result);
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-
-        // Verify again
-        let verify2 = cdp.evaluate(&verify_js).await?;
-        tracing::info!("Model selector verify (2nd): {:?}", verify2);
-        if let Some(s) = verify2.as_str() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-                if v.get("contains_target").and_then(|b| b.as_bool()).unwrap_or(false) {
-                    model_confirmed = true;
-                    tracing::info!("✓ Model UI confirmed on retry: {} is selected", escaped_model);
-                }
-            }
-        }
-    }
-
-    // ── Type a placeholder message and click send ──
-    // The fetch hook will rewrite the content to zair's message, so the
-    // placeholder value doesn't matter — it just needs to enable the send button.
-    cdp.evaluate(r#"
-        (function(){
-            const ta = document.querySelector('textarea');
-            if (!ta) return 'no_textarea';
-            ta.focus();
-            const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-            setter.call(ta, 'placeholder');
-            ta.dispatchEvent(new Event('input', { bubbles: true }));
-            ta.dispatchEvent(new Event('change', { bubbles: true }));
-            return 'typed';
-        })()
-    "#).await?;
-    tokio::time::sleep(Duration::from_millis(800)).await;
-
-    // Click send button
-    let click_result = cdp.evaluate(r#"
-        (function(){
-            const sendDivs = [...document.querySelectorAll('[aria-label]')].filter(el => {
-                const al = el.getAttribute('aria-label') || '';
-                return al.includes('发送') || al.includes('Send');
-            });
-            if (sendDivs.length === 0) return 'no_send_div';
-            const sendDiv = sendDivs[0];
-            const btn = sendDiv.querySelector('button') || sendDiv;
-            if (btn.disabled) return 'btn_disabled';
-            btn.click();
-            return 'clicked';
-        })()
-    "#).await?;
-    tracing::info!("Send click: {:?}", click_result);
-
-    // ── Poll for SSE chunks, forward to callback ──
-    let mut accumulated_content = String::new();
-    let mut thinking_content = String::new();
-    let mut current_mode = "text".to_string();
-    let mut tag_buffer = String::new();
-    let mut chunk_idx = 0usize;
-    let mut captured_conversation_id = String::new();
-    let mut request_body_seen = false;
-
-    // Wait up to 120s for the SSE stream to complete
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    let poll_js = r#"
-        (function(){
-            const s = window.__zair_agent_chat || {};
-            return JSON.stringify({
-                chunks: s.chunks || [],
-                done: !!s.done,
-                error: s.error || null,
-                request_body: s.request_body || null,
-                last_chunk_at: s.last_chunk_at || 0,
-            });
-        })()
-    "#;
-
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let r = cdp.evaluate(poll_js).await?;
-        let s = match r.as_str() {
-            Some(s) => s,
-            None => continue,
-        };
-        let v: serde_json::Value = match serde_json::from_str(s) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Log the captured request body once (for diagnostics)
-        if !request_body_seen {
-            if let Some(rb) = v.get("request_body") {
-                if !rb.is_null() {
-                    request_body_seen = true;
-                    let model_used = rb.get("model").and_then(|m| m.as_str()).unwrap_or("?");
-                    let flags = rb.get("features")
-                        .and_then(|f| f.get("flags"))
-                        .and_then(|f| f.as_array())
-                        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(","))
-                        .unwrap_or_default();
-                    let captcha_len = rb.get("captcha_verify_param")
-                        .and_then(|c| c.as_str())
-                        .map(|s| s.len())
-                        .unwrap_or(0);
-                    let msg_content = rb.get("messages")
-                        .and_then(|m| m.as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("?");
-                    tracing::info!(
-                        "Browser sent chat request: model={}, flags=[{}], captcha_len={}, messages[0].content={:?}",
-                        model_used, flags, captcha_len, msg_content
-                    );
-                    // Dump full request body and top-level keys for diagnosing
-                    // server-side errors (e.g. WORKSPACE_TOOL_INIT_ERROR from
-                    // an unwanted `tools` / `workspace_id` field).
-                    let top_keys: Vec<String> = rb.as_object()
-                        .map(|o| o.keys().cloned().collect())
-                        .unwrap_or_default();
-                    tracing::info!(
-                        "Request body top-level keys: {:?}",
-                        top_keys
-                    );
-                    tracing::info!(
-                        "Full request body: {}",
-                        serde_json::to_string(&rb).unwrap_or_default()
-                    );
-                }
-            }
-        }
-
-        // Process any new chunks
-        if let Some(chunks) = v.get("chunks").and_then(|c| c.as_array()) {
-            while chunk_idx < chunks.len() {
-                let chunk_text = chunks[chunk_idx]
-                    .get("text")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
-                chunk_idx += 1;
-                if chunk_text.is_empty() { continue; }
-
-                // Parse each SSE line
-                for line in chunk_text.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || !line.starts_with("data:") { continue; }
-                    let data_str = line[5..].trim();
-                    if data_str == "[DONE]" || data_str.is_empty() { continue; }
-                    let data: serde_json::Value = match serde_json::from_str(data_str) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
-
-                    // Check for embedded business errors
-                    if let Some(err_msg) = crate::client::detect_embedded_error_pub(&data) {
-                        bail!("{}", err_msg);
-                    }
-
-                    // Capture conversation_id
-                    for field in &["conversation_id", "chat_id", "id"] {
-                        if let Some(cid) = data.get(*field).and_then(|v| v.as_str()) {
-                            if !cid.is_empty() { captured_conversation_id = cid.to_string(); }
-                        }
-                    }
-
-                    // Extract reasoning_content (thinking)
-                    if let Some(rc) = data.get("choices")
-                        .and_then(|c| c.as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|c| c.get("delta"))
-                        .and_then(|d| d.get("reasoning_content"))
-                        .and_then(|r| r.as_str())
-                    {
-                        if !rc.is_empty() {
-                            thinking_content.push_str(rc);
-                            if let Some(cb) = callback {
-                                cb(rc, true);
-                            }
-                        }
-                    }
-
-                    // Extract content delta
-                    if let Some(content) = data.get("choices")
-                        .and_then(|c| c.as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|c| c.get("delta"))
-                        .and_then(|d| d.get("content"))
-                        .and_then(|r| r.as_str())
-                    {
-                        if !content.is_empty() {
-                            crate::client::emit_delta_pub(
-                                content,
-                                &mut current_mode,
-                                &mut tag_buffer,
-                                &mut accumulated_content,
-                                &mut thinking_content,
-                                &callback,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check if done
-        let done = v.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
-        let err = v.get("error").and_then(|e| e.as_str());
-        if let Some(e) = err {
-            bail!("Browser SSE stream error: {}", e);
-        }
-        if done {
-            // Flush any remaining tag_buffer
-            if !tag_buffer.is_empty() {
-                if current_mode == "thinking" {
-                    thinking_content.push_str(&tag_buffer);
-                    if let Some(cb) = callback { cb(&tag_buffer, true); }
-                } else {
-                    accumulated_content.push_str(&tag_buffer);
-                    if let Some(cb) = callback { cb(&tag_buffer, false); }
-                }
-            }
-            tracing::info!(
-                "Browser Agent chat done: reply_chars={}, thinking_chars={}, elapsed={}ms",
-                accumulated_content.chars().count(),
-                thinking_content.chars().count(),
-                start.elapsed().as_millis()
-            );
-            break;
-        }
-    }
-
-    // Flush remaining tag buffer if we timed out
-    if !tag_buffer.is_empty() {
-        if current_mode == "thinking" {
-            thinking_content.push_str(&tag_buffer);
-        } else {
-            accumulated_content.push_str(&tag_buffer);
-        }
-    }
-
-    let elapsed_ms = start.elapsed().as_millis() as u64;
-    session.shutdown();
-
-    Ok(BrowserChatResult {
-        reply: accumulated_content,
-        thinking: thinking_content,
-        raw_length: 0,
-        elapsed_ms,
-    })
+    session.chat_agent(message, model, callback).await
 }
+
 
 
 /// Launch a stealth Chrome session, trigger one real chat on chat.z.ai,

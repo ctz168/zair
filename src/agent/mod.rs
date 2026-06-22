@@ -734,7 +734,8 @@ impl AgentRuntime {
 
                     // ── Run chat (Agent or Normal) ──
                     let chat_result: Result<browser::BrowserChatResult, anyhow::Error> = if agent_mode {
-                        // Agent mode: browser fetch hijack
+                        // Agent mode: browser fetch hijack via persistent session
+                        // (reuses Chrome across calls → ~10-15s instead of ~80s)
                         let stream_tx_for_cb = stream_tx.clone();
                         let cb: StreamCallback = Box::new(move |delta: &str, is_thinking: bool| {
                             let chunk = StreamChunk {
@@ -745,17 +746,20 @@ impl AgentRuntime {
                         });
                         let agent_model = config.agent.model.clone();
                         let agent_message = content_owned.clone();
-                        let agent_auth = auth.clone();
 
-                        match tokio::time::timeout(
-                            Duration::from_secs(180),
-                            browser::chat_via_browser_agent(
-                                &agent_auth,
-                                &agent_message,
-                                &agent_model,
-                                Some(&cb),
-                            ),
-                        ).await {
+                        let agent_result = {
+                            let mut session_guard = browser_session.lock().await;
+                            if session_guard.is_none() {
+                                tracing::info!("Creating new BrowserSession for Agent mode...");
+                                *session_guard = Some(BrowserSession::new(&auth));
+                            }
+                            let session = session_guard.as_mut().unwrap();
+                            tokio::time::timeout(
+                                Duration::from_secs(180),
+                                session.chat_agent(&agent_message, &agent_model, Some(&cb)),
+                            ).await
+                        };
+                        match agent_result {
                             Ok(Ok(r)) => Ok(r),
                             Ok(Err(e)) => Err(e),
                             Err(_) => Err(anyhow::anyhow!("Agent mode timed out (3 minutes)")),

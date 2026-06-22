@@ -308,14 +308,32 @@ async fn main() -> anyhow::Result<()> {
                     "ECONNRESET",
                     "ECONNREFUSED",
                     "ETIMEDOUT",
+                    "Agent mode produced no response",
                 ];
                 retryable_markers.iter().any(|m| s.contains(m))
+            }
+
+            // Errors that signal Agent-mode is broken on the server side
+            // (MCP init failure, model concurrency, etc.). When these happen
+            // repeatedly, we should give up on Agent mode and fall back to
+            // the chat-mode path (BrowserSession::chat via DOM polling).
+            fn is_agent_unavailable(err: &anyhow::Error) -> bool {
+                let s = err.to_string();
+                s.contains("WORKSPACE_TOOL_INIT_ERROR")
+                    || s.contains("MODEL_CONCURRENCY_LIMIT")
+                    || s.contains("MCP")
+                    || s.contains("Agent mode produced no response")
             }
 
             let started = std::time::Instant::now();
             let max_attempts = 5;
             let mut final_result: Result<browser::BrowserChatResult, anyhow::Error> =
                 Err(anyhow::anyhow!("no attempt made"));
+
+            // Create ONE persistent BrowserSession for all retry attempts so
+            // Chrome is launched only once (~5s) and subsequent attempts reuse
+            // it (~10-15s each instead of ~80s each).
+            let mut agent_session = browser::BrowserSession::new(&auth_state);
 
             for attempt in 1..=max_attempts {
                 if attempt > 1 {
@@ -362,7 +380,7 @@ async fn main() -> anyhow::Result<()> {
                 });
 
                 let attempt_start = std::time::Instant::now();
-                let result = browser::chat_via_browser_agent(&auth_state, &message, &model, Some(&cb)).await;
+                let result = agent_session.chat_agent(&message, &model, Some(&cb)).await;
                 drop(cb);
                 let _ = printer.await;
 
@@ -397,8 +415,66 @@ async fn main() -> anyhow::Result<()> {
                             break;
                         }
                         if attempt == max_attempts {
-                            eprintln!("\x1b[31m  (max attempts reached, giving up)\x1b[0m");
-                            final_result = Err(e);
+                            // Last attempt failed — try Agent → Chat fallback
+                            // if the failure looks like an Agent-mode server issue.
+                            if is_agent_unavailable(&e) {
+                                eprintln!("\x1b[33m  Agent mode unavailable on server, falling back to chat-mode (DOM polling)...\x1b[0m");
+                                // Reset the persistent browser session back to
+                                // non-Agent mode: clears the localStorage
+                                // `selectedModels=[glm-5.2]` and reloads so the
+                                // UI falls back to the default chat model
+                                // (GLM-4.7). Without this, BrowserSession::chat
+                                // would just re-send the same Agent-mode request
+                                // and hit the same server error.
+                                if let Err(switch_err) = agent_session.switch_to_chat_mode().await {
+                                    eprintln!("\x1b[33m  switch_to_chat_mode warning: {}\x1b[0m", switch_err);
+                                }
+                                let (fb_tx, mut fb_rx) =
+                                    tokio::sync::mpsc::channel::<browser::StreamChunk>(128);
+                                let fb_printer = tokio::spawn(async move {
+                                    use std::io::Write;
+                                    while let Some(chunk) = fb_rx.recv().await {
+                                        match chunk.chunk_type.as_str() {
+                                            "thinking" | "think" => {
+                                                eprint!("\x1b[2m{}\x1b[0m", chunk.data);
+                                                let _ = std::io::stderr().flush();
+                                            }
+                                            "reply" | "content" | "text" | "" => {
+                                                print!("{}", chunk.data);
+                                                let _ = std::io::stdout().flush();
+                                            }
+                                            _ => {
+                                                eprintln!("[chunk:{}] {}", chunk.chunk_type, chunk.data);
+                                            }
+                                        }
+                                    }
+                                });
+                                let fb_result = agent_session
+                                    .chat(&message, Some(fb_tx.clone()))
+                                    .await;
+                                drop(fb_tx);
+                                let _ = fb_printer.await;
+                                match fb_result {
+                                    Ok(r) => {
+                                        eprintln!();
+                                        eprintln!(
+                                            "\x1b[32m=== chat-mode fallback succeeded ===\x1b[0m"
+                                        );
+                                        final_result = Ok(r);
+                                        break;
+                                    }
+                                    Err(fe) => {
+                                        eprintln!(
+                                            "\x1b[31m  chat-mode fallback also failed: {}\x1b[0m",
+                                            fe
+                                        );
+                                        final_result = Err(fe);
+                                    }
+                                }
+                            } else {
+                                eprintln!("\x1b[31m  (max attempts reached, giving up)\x1b[0m");
+                                final_result = Err(e);
+                            }
                         } else {
                             eprintln!("\x1b[33m  (retryable, will retry)\x1b[0m");
                             final_result = Err(e);

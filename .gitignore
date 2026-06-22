@@ -9,6 +9,8 @@ Cargo.lock
 
 # Logs
 *.log
+*.log.bat
+*.log.err
 
 # OS files
 .DS_Store
@@ -47,6 +49,13 @@ upload/
 auth.js
 client.js
 stealth.js
+
+# Backups and test runners
+*.bak*
+run_*.bat
+run_apichat.bat
+run_test.bat
+start_ps.ps1
 
 # Work log (local only)
 worklog.md
