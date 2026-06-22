@@ -28,6 +28,28 @@ pub struct AgentConfig {
     /// API key for open.bigmodel.cn (fallback when chat.z.ai is blocked by CDN)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+
+    // ── Agent mode (glm-5.2 with general_agent flag) ──
+    /// Default user name injected into the `variables` map as `{{USER_NAME}}`.
+    /// Used when building the Agent-mode payload in `chat_web_api_agent`.
+    #[serde(default = "default_user_name")]
+    pub user_name: String,
+
+    /// Extra variables to merge into the Agent payload's `variables` dict.
+    /// Should be a JSON object mapping `"{{KEY}}"` -> value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variables: Option<serde_json::Value>,
+
+    /// Hardcoded captcha_verify_param for Agent mode (short-term solution).
+    /// Agent mode may trigger Z.AI's risk control, which requires a valid
+    /// captcha token in the request. Long-term this should be fetched
+    /// automatically from the browser session via CDP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captcha_verify_param: Option<String>,
+}
+
+fn default_user_name() -> String {
+    "Wei Liu".to_string()
 }
 
 impl Default for AppConfig {
@@ -50,6 +72,9 @@ impl Default for AppConfig {
                 stream_chunk_size: 20,
                 stream_chunk_delay_ms: 50,
                 api_key: None,
+                user_name: "Wei Liu".to_string(),
+                variables: None,
+                captcha_verify_param: None,
             },
         }
     }
