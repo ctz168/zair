@@ -1627,9 +1627,11 @@ impl BrowserSession {
 
         // Reload so the UI picks up the new (default) model
         cdp.evaluate("location.reload(true)").await?;
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        tokio::time::sleep(Duration::from_secs(6)).await;
 
-        // Verify the model selector no longer shows a GLM-5.x model
+        // Verify the model selector no longer shows a GLM-5.x model.
+        // Sometimes the first reload doesn't take effect (page was mid-render),
+        // so retry once with a second reload if needed.
         let verify_js = r#"
             (function(){
                 const sel = document.querySelector('button.modelSelectorButton, button[aria-label="选择一个模型"]');
@@ -1640,8 +1642,34 @@ impl BrowserSession {
                 return JSON.stringify({ready: true, text: text, is_agent_model: is_agent});
             })()
         "#;
-        let verify_result = cdp.evaluate(verify_js).await?;
+        let mut verify_result = cdp.evaluate(verify_js).await?;
         tracing::info!("After reset, model selector: {:?}", verify_result);
+
+        // Check if the model is still GLM-5.x — if so, retry with another reload
+        let mut needs_retry = false;
+        if let Some(s) = verify_result.as_str() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                if v.get("is_agent_model").and_then(|b| b.as_bool()).unwrap_or(false) {
+                    needs_retry = true;
+                }
+            }
+        }
+        if needs_retry {
+            tracing::warn!("Model still GLM-5.x after first reload, retrying with second reload...");
+            // Re-set localStorage (in case the reload cleared it)
+            cdp.evaluate(r#"
+                (function(){
+                    localStorage.setItem('selectedModels', JSON.stringify(['glm-4.7']));
+                    localStorage.removeItem('last_selected_agent_model');
+                    localStorage.removeItem('last_mode');
+                    return localStorage.getItem('selectedModels');
+                })()
+            "#).await?;
+            cdp.evaluate("location.reload(true)").await?;
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            verify_result = cdp.evaluate(verify_js).await?;
+            tracing::info!("After second reset, model selector: {:?}", verify_result);
+        }
 
         // Force re-initialization on next chat() call (textarea check etc.)
         self.initialized = false;
@@ -1703,6 +1731,93 @@ async fn type_message_and_poll(
     // Find and type into the textarea
     let msg_preview: String = message.chars().take(60).collect();
     tracing::info!("Sending message: \"{}\"", msg_preview);
+
+    // ── Install SSE capture hook BEFORE sending the message ──
+    // This intercepts the /chat/completions POST response and captures
+    // the SSE stream chunks. We then parse them for delta.content and
+    // delta.reasoning_content, emitting per-chunk deltas through stream_tx.
+    // This gives true streaming (many small chunks) instead of the
+    // 1-second-granularity DOM polling deltas.
+    //
+    // The hook is the same idea as chat_agent's, but uses a different
+    // window variable name so it doesn't collide if both paths run.
+    let sse_hook_js = r#"
+        (function(){
+            window.__zair_chat_sse = {
+                chunks: [],
+                done: false,
+                error: null,
+                started_at: Date.now(),
+                last_chunk_at: 0,
+                request_body: null,
+            };
+            if (window.__zair_chat_sse_hook_installed) {
+                // Hook already installed — just reset state (done above)
+                return 'already_installed';
+            }
+            window.__zair_chat_sse_hook_installed = true;
+            const origFetch = window.fetch;
+            window.fetch = async function(input, init) {
+                const url = (typeof input === 'string') ? input : (input && input.url) || '';
+                const method = (init && init.method) || (input && input.method) || 'GET';
+                if (method.toUpperCase() === 'POST' && url.includes('/chat/completions')) {
+                    try {
+                        // Capture the request body for diagnostics
+                        let bodyStr = '';
+                        if (init && init.body) {
+                            const body = init.body;
+                            if (typeof body === 'string') bodyStr = body;
+                            else if (body instanceof Blob) bodyStr = await body.text();
+                            else if (body instanceof ArrayBuffer) bodyStr = new TextDecoder().decode(body);
+                        } else if (input instanceof Request) {
+                            const cloned = input.clone();
+                            bodyStr = await cloned.text();
+                        }
+                        if (bodyStr) {
+                            try { window.__zair_chat_sse.request_body = JSON.parse(bodyStr); } catch(e) {}
+                        }
+                    } catch(e) {
+                        console.error('[zair] SSE hook body capture error:', e);
+                    }
+                    // Call original fetch
+                    const response = await origFetch.apply(this, arguments);
+                    // Intercept the response stream
+                    if (response.body) {
+                        // IMPORTANT: clone() must be called BEFORE getReader().
+                        // getReader() locks/disturbs the body, and calling
+                        // clone() afterwards throws "Response body is already used".
+                        // By cloning first, we get a separate readable stream
+                        // for the browser's own JS, and we read from the original.
+                        const cloned = response.clone();
+                        const reader = response.body.getReader();
+                        const decoder = new TextDecoder();
+                        const state = window.__zair_chat_sse;
+                        (async function() {
+                            try {
+                                while (true) {
+                                    const { done, value } = await reader.read();
+                                    if (done) break;
+                                    const text = decoder.decode(value, { stream: true });
+                                    state.chunks.push({ ts: Date.now(), text });
+                                    state.last_chunk_at = Date.now();
+                                }
+                                state.done = true;
+                            } catch(e) {
+                                state.done = true;
+                                state.error = e.message;
+                            }
+                        })();
+                        return cloned;
+                    }
+                    return response;
+                }
+                return origFetch.apply(this, arguments);
+            };
+            return 'installed';
+        })()
+    "#;
+    let hook_result = cdp.evaluate(sse_hook_js).await?;
+    tracing::info!("Chat SSE hook: {:?}", hook_result);
 
     // Check textarea state
     let textarea_check = cdp.evaluate(r#"
@@ -1943,8 +2058,153 @@ async fn type_message_and_poll(
     let mut last_total_length: usize = 0;
     let mut stable_count = 0;
 
+    // ── SSE chunk tracking ──
+    // We poll window.__zair_chat_sse.chunks for new SSE data. Each chunk
+    // contains raw SSE text (multiple "data:" lines). We parse each line
+    // for delta.content and delta.reasoning_content, emitting per-chunk
+    // deltas through stream_tx. This gives true streaming granularity
+    // (many small chunks) instead of 1-second DOM polling deltas.
+    let mut sse_chunk_idx: usize = 0;
+    let mut sse_emitted_any = false;
+    // Track the accumulated SSE text separately so we can compare with
+    // DOM text and use whichever is longer at the end.
+    let mut sse_reply_text = String::new();
+    let mut sse_thinking_text = String::new();
+    let mut sse_done = false;
+
+    let sse_poll_js = r#"
+        (function(){
+            const s = window.__zair_chat_sse || {};
+            return JSON.stringify({
+                chunks: s.chunks || [],
+                done: !!s.done,
+                error: s.error || null,
+                request_body: s.request_body || null,
+                last_chunk_at: s.last_chunk_at || 0,
+            });
+        })()
+    "#;
+
     for poll_idx in 0..120 {
         tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // ── FIRST: Poll SSE chunks (true streaming) ──
+        if !sse_done {
+            let sse_result = cdp.evaluate(sse_poll_js).await;
+            if let Ok(ref r) = sse_result {
+                if let Some(s) = r.as_str() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                        // Process new chunks
+                        if let Some(chunks) = v.get("chunks").and_then(|c| c.as_array()) {
+                            while sse_chunk_idx < chunks.len() {
+                                let chunk_text = chunks[sse_chunk_idx]
+                                    .get("text")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("");
+                                sse_chunk_idx += 1;
+                                if chunk_text.is_empty() { continue; }
+
+                                // Parse each SSE line
+                                for line in chunk_text.lines() {
+                                    let line = line.trim();
+                                    if line.is_empty() || !line.starts_with("data:") { continue; }
+                                    let data_str = line[5..].trim();
+                                    if data_str == "[DONE]" || data_str.is_empty() { continue; }
+                                    let data: serde_json::Value = match serde_json::from_str(data_str) {
+                                        Ok(d) => d,
+                                        Err(_) => continue,
+                                    };
+
+                                    // Check for embedded business errors
+                                    if let Some(err_msg) = crate::client::detect_embedded_error_pub(&data) {
+                                        tracing::warn!("SSE embedded error: {}", err_msg);
+                                        // Don't bail — let DOM polling try to extract whatever
+                                        // the browser rendered. The error might be recoverable.
+                                        continue;
+                                    }
+
+                                    // Extract reasoning_content (thinking)
+                                    if let Some(rc) = data.get("choices")
+                                        .and_then(|c| c.as_array())
+                                        .and_then(|a| a.first())
+                                        .and_then(|c| c.get("delta"))
+                                        .and_then(|d| d.get("reasoning_content"))
+                                        .and_then(|r| r.as_str())
+                                    {
+                                        if !rc.is_empty() {
+                                            sse_thinking_text.push_str(rc);
+                                            sse_emitted_any = true;
+                                            if let Some(ref tx) = stream_tx {
+                                                let _ = tx.send(StreamChunk {
+                                                    chunk_type: "thinking".to_string(),
+                                                    data: rc.to_string(),
+                                                }).await;
+                                            }
+                                        }
+                                    }
+
+                                    // Extract content delta (reply)
+                                    if let Some(content) = data.get("choices")
+                                        .and_then(|c| c.as_array())
+                                        .and_then(|a| a.first())
+                                        .and_then(|c| c.get("delta"))
+                                        .and_then(|d| d.get("content"))
+                                        .and_then(|r| r.as_str())
+                                    {
+                                        if !content.is_empty() {
+                                            sse_reply_text.push_str(content);
+                                            sse_emitted_any = true;
+                                            if let Some(ref tx) = stream_tx {
+                                                let _ = tx.send(StreamChunk {
+                                                    chunk_type: "text".to_string(),
+                                                    data: content.to_string(),
+                                                }).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Check if SSE stream is done
+                        let done = v.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
+                        let err = v.get("error").and_then(|e| e.as_str());
+
+                        // Debug: dump first 3 chunks to understand SSE format
+                        if sse_chunk_idx > 0 && sse_chunk_idx <= 3 {
+                            if let Some(chunks) = v.get("chunks").and_then(|c| c.as_array()) {
+                                let dump_idx = sse_chunk_idx - 1;
+                                if dump_idx < chunks.len() {
+                                    let raw = chunks[dump_idx]
+                                        .get("text")
+                                        .and_then(|t| t.as_str())
+                                        .unwrap_or("");
+                                    tracing::info!(
+                                        "SSE chunk #{} (first 500 chars): {:?}",
+                                        dump_idx + 1,
+                                        &raw[..raw.len().min(500)]
+                                    );
+                                }
+                            }
+                        }
+
+                        if let Some(e) = err {
+                            tracing::warn!("SSE stream error: {}", e);
+                            sse_done = true;
+                        }
+                        if done {
+                            tracing::info!(
+                                "SSE stream done after {} chunks (reply: {} chars, thinking: {} chars)",
+                                sse_chunk_idx,
+                                sse_reply_text.chars().count(),
+                                sse_thinking_text.chars().count()
+                            );
+                            sse_done = true;
+                        }
+                    }
+                }
+            }
+        }
 
         // Debug logging for first few polls
         if poll_idx < 5 {
@@ -2144,6 +2404,14 @@ async fn type_message_and_poll(
                     let reply_len = reply.len();
                     let total_len = thinking_len + reply_len;
 
+                    // ── DOM delta emission ──
+                    // If SSE is providing data, we use SSE for streaming
+                    // output and DOM only for stability detection. This
+                    // avoids double-emitting deltas (SSE already sent them
+                    // with finer granularity). If SSE never fired, we fall
+                    // back to DOM-based delta emission (1s granularity).
+                    let use_dom_for_streaming = !sse_emitted_any;
+
                     // Track thinking deltas
                     if thinking_len > last_thinking_length {
                         let safe_start = if last_thinking_length <= thinking_len {
@@ -2159,14 +2427,16 @@ async fn type_message_and_poll(
                         if safe_start < thinking_len {
                             let delta = &thinking[safe_start..];
                             if !delta.is_empty() {
-                                eprint!("{}", delta);
-                                thinking_text.push_str(delta);
-                                if let Some(ref tx) = stream_tx {
-                                    let _ = tx.send(StreamChunk {
-                                        chunk_type: "thinking".to_string(),
-                                        data: delta.to_string(),
-                                    }).await;
+                                if use_dom_for_streaming {
+                                    eprint!("{}", delta);
+                                    if let Some(ref tx) = stream_tx {
+                                        let _ = tx.send(StreamChunk {
+                                            chunk_type: "thinking".to_string(),
+                                            data: delta.to_string(),
+                                        }).await;
+                                    }
                                 }
+                                thinking_text.push_str(delta);
                             }
                         }
                         last_thinking_length = thinking_len;
@@ -2190,14 +2460,16 @@ async fn type_message_and_poll(
                         if safe_start < reply_len {
                             let delta = &reply[safe_start..];
                             if !delta.is_empty() {
-                                eprint!("{}", delta);
-                                reply_text.push_str(delta);
-                                if let Some(ref tx) = stream_tx {
-                                    let _ = tx.send(StreamChunk {
-                                        chunk_type: "text".to_string(),
-                                        data: delta.to_string(),
-                                    }).await;
+                                if use_dom_for_streaming {
+                                    eprint!("{}", delta);
+                                    if let Some(ref tx) = stream_tx {
+                                        let _ = tx.send(StreamChunk {
+                                            chunk_type: "text".to_string(),
+                                            data: delta.to_string(),
+                                        }).await;
+                                    }
                                 }
+                                reply_text.push_str(delta);
                             }
                         }
                         last_reply_length = reply_len;
@@ -2222,6 +2494,24 @@ async fn type_message_and_poll(
                     };
 
                     let has_real_content = !is_only_placeholder(thinking) || !is_only_placeholder(reply);
+
+                    // ── Early exit if SSE stream is done and has real content ──
+                    // When SSE provides the full response, we don't need to wait
+                    // for DOM stability — the SSE stream is the authoritative
+                    // source. DOM might lag behind (animations, rendering delay)
+                    // and cause unnecessary 5s stability waits.
+                    if sse_done && sse_emitted_any && !sse_reply_text.is_empty() {
+                        tracing::info!(
+                            "SSE done with {} chars reply, exiting early (poll #{})",
+                            sse_reply_text.chars().count(),
+                            poll_idx
+                        );
+                        // Use SSE text as the authoritative result
+                        reply_text = sse_reply_text.clone();
+                        thinking_text = sse_thinking_text.clone();
+                        break;
+                    }
+
                     if total_len > 0 && total_len == last_total_length {
                         if !has_real_content {
                             // Still in "thinking" phase - content is just placeholders
@@ -2247,9 +2537,28 @@ async fn type_message_and_poll(
 
     let elapsed = start.elapsed().as_millis() as u64;
 
+    // ── Use SSE text as authoritative if available ──
+    // If SSE provided data, it's more accurate than DOM extraction (no
+    // CSS/placeholder contamination, exact server output). If SSE never
+    // fired (hook missed the request), fall back to DOM text.
+    let (final_reply, final_thinking) = if sse_emitted_any && !sse_reply_text.is_empty() {
+        (sse_reply_text.clone(), sse_thinking_text.clone())
+    } else {
+        (reply_text, thinking_text)
+    };
+
+    tracing::info!(
+        "Chat result: reply={} chars, thinking={} chars, sse_chunks={}, sse_used={}, elapsed={}ms",
+        final_reply.chars().count(),
+        final_thinking.chars().count(),
+        sse_chunk_idx,
+        sse_emitted_any,
+        elapsed,
+    );
+
     Ok(BrowserChatResult {
-        reply: reply_text,
-        thinking: thinking_text,
+        reply: final_reply,
+        thinking: final_thinking,
         raw_length: last_total_length,
         elapsed_ms: elapsed,
     })
