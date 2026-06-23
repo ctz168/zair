@@ -2017,25 +2017,37 @@ async fn type_message_and_poll(
                 // chat.z.ai renders thinking steps in .thinking-block elements which are VISIBLE.
                 // The .thinking-chain-container just shows a collapsed summary like "思考过程".
                 // Always use innerText (NOT textContent) so stability detection works correctly.
+                //
+                // IMPORTANT: thinking-block elements sometimes contain <style> tags with
+                // CSS animations (e.g. @property --beam-angle-bb-2 { ... }) used for the
+                // "thinking pulse" UI effect. innerText will include this CSS as text,
+                // producing 7000+ char "thinking" outputs that are actually CSS garbage.
+                // We strip <style> and <script> tags from the clone before reading innerText.
                 const thinkingBlocks = document.querySelectorAll('[class*="thinking-block"]');
-                const placeholders = ['Thought Process', 'Thinking...', '正在思考', '跳过', 
+                const placeholders = ['Thought Process', 'Thinking...', '正在思考', '跳过',
                     '正在思考\n跳过', '跳过\n正在思考', '思考过程', '思考'];
-                
+
                 if (thinkingBlocks.length > 0) {
                     // thinking-block elements contain the actual visible reasoning text
                     thinkingBlocks.forEach(el => {
-                        const text = el.innerText.trim();
+                        const clone = el.cloneNode(true);
+                        // Strip <style>/<script> tags so their CSS/JS content doesn't
+                        // leak into the thinking text via innerText.
+                        clone.querySelectorAll('style, script').forEach(s => s.remove());
+                        const text = clone.innerText.trim();
                         if (text && !placeholders.includes(text) && text.length > 2) {
                             thinkingText += text + '\n';
                         }
                     });
                 }
-                
+
                 // ─── Strategy 2: Fallback to thinking-chain-container ──
                 if (!thinkingText) {
                     const thinkingContainers = document.querySelectorAll('[class*="thinking-chain"]');
                     thinkingContainers.forEach(el => {
-                        const text = el.innerText.trim();
+                        const clone = el.cloneNode(true);
+                        clone.querySelectorAll('style, script').forEach(s => s.remove());
+                        const text = clone.innerText.trim();
                         // Filter out pure placeholders
                         if (text && !placeholders.includes(text) && text.length > 2) {
                             // Remove "思考过程" header prefix if present
@@ -2060,6 +2072,8 @@ async fn type_message_and_poll(
                         clone.querySelectorAll('[class*="thinking-chain"], [class*="thinking-block"], [class*="chain-of-thought"]').forEach(el => el.remove());
                         // Remove user message elements
                         clone.querySelectorAll('[class*="user-message"], [class*="edit-user-message"]').forEach(el => el.remove());
+                        // Strip <style>/<script> tags (z.ai injects CSS for animations)
+                        clone.querySelectorAll('style, script').forEach(s => s.remove());
                         replyText = clone.innerText.trim();
                     }
                 }
@@ -2072,6 +2086,7 @@ async fn type_message_and_poll(
                         const clone = chatAssistant.cloneNode(true);
                         clone.querySelectorAll('[class*="thinking-chain"], [class*="thinking-block"], [class*="think"], [class*="reasoning"], [class*="chain-of-thought"]').forEach(el => el.remove());
                         clone.querySelectorAll('[class*="user-message"], [class*="edit-user-message"], [class*="chat-user"]').forEach(el => el.remove());
+                        clone.querySelectorAll('style, script').forEach(s => s.remove());
                         replyText = clone.innerText.trim();
                     }
                 }
@@ -2102,6 +2117,7 @@ async fn type_message_and_poll(
                         if (classes.includes('think') || classes.includes('reasoning')) continue;
                         const clone = el.cloneNode(true);
                         clone.querySelectorAll('[class*="thinking-chain"], [class*="thinking-block"], [class*="think"], [class*="reasoning"], [class*="user-message"]').forEach(e => e.remove());
+                        clone.querySelectorAll('style, script').forEach(s => s.remove());
                         const text = clone.innerText.trim();
                         if (text && text.length > 2) { replyText = text; break; }
                     }

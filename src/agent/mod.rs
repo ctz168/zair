@@ -431,6 +431,31 @@ impl AgentRuntime {
 
         let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::channel::<tungstenite::Message>(100);
 
+        // ── Start a heartbeat task to keep the WS alive ──
+        // AICQ server disconnects idle connections after ~90s. We send an
+        // application-level "ping" JSON message every 30s. We don't use
+        // WebSocket protocol-level Ping because AICQ's server doesn't seem
+        // to handle them properly (connection gets reset).
+        let heartbeat_tx = outgoing_tx.clone();
+        let heartbeat_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.tick().await; // skip first immediate tick
+            loop {
+                interval.tick().await;
+                // Send an application-level ping. The server likely ignores
+                // unknown message types, but the bytes keep the TCP
+                // connection active and prevent idle-timeout disconnects.
+                let ping_msg = serde_json::json!({"type": "ping", "ts": chrono::Utc::now().timestamp_millis()}).to_string();
+                if heartbeat_tx
+                    .send(tungstenite::Message::Text(ping_msg))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
         let writer_handle = tokio::spawn(async move {
             while let Some(msg) = outgoing_rx.recv().await {
                 match &msg {
@@ -493,6 +518,9 @@ impl AgentRuntime {
         //     }
         //     *session = None;
         // }
+
+        // Abort the heartbeat task since we're about to disconnect
+        heartbeat_task.abort();
 
         tracing::info!("WebSocket loop ended");
         Ok(())
